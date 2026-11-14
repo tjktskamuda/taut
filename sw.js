@@ -1,5 +1,5 @@
 // Taut — service worker: aplikasi tetap bisa dibuka walau koneksi tidak stabil
-const V = '1.2.0';
+const V = '1.2.1';
 const CACHE = 'taut-v' + V;
 const SHELL = [
   './', 'index.html', 'css/app.css?v=' + V, 'js/app.js?v=' + V, 'js/net.js?v=' + V, 'js/util.js?v=' + V, 'js/icons.js?v=' + V,

@@ -5,14 +5,14 @@ import {
   makeThumb, downloadBlob, shareBlob, makeZip, chime, audioCtx, loadScript,
   isObj, hasOwn, okKey, okUid, okCode, okId, dict, safeInt, cleanStr, cleanName, cleanFileName, safeMime, safeBlob, okThumb,
   enc, hex, unhex, randHex, b64, unb64,
-} from './util.js?v=1.2.0';
-import { icon, kindIcon, deviceIcon, logo, stopLogo, deviceArt } from './icons.js?v=1.2.0';
-import { Net, DEFAULT_SIGNAL, LIMITS } from './net.js?v=1.2.0';
+} from './util.js?v=1.2.1';
+import { icon, kindIcon, deviceIcon, logo, stopLogo, deviceArt } from './icons.js?v=1.2.1';
+import { Net, DEFAULT_SIGNAL, LIMITS } from './net.js?v=1.2.1';
 
 // Tolak dijalankan di dalam bingkai halaman lain (mencegah clickjacking pada tombol Izinkan)
 if (window.__tautFramed) throw new Error('Taut tidak boleh dibuka di dalam bingkai.');
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const PROTO = 2; // versi protokol jabat tangan
 const DEV_HOST = ['localhost', '127.0.0.1'].includes(location.hostname);
 const TYPES = new Set(['phone', 'tablet', 'laptop', 'desktop']);
@@ -2057,7 +2057,7 @@ function qrSvg(text, size) {
   const finder = (x, y) => `<rect x="${x + 0.5}" y="${y + 0.5}" width="6" height="6" rx="1.8" fill="none" stroke="currentColor" stroke-width="1"/><rect x="${x + 2}" y="${y + 2}" width="3" height="3" rx=".9"/>`;
   const L = logoR * 2;
   return `<svg viewBox="-2 -2 ${n + 4} ${n + 4}" width="${size}" height="${size}" class="qr-svg"><rect x="-2" y="-2" width="${n + 4}" height="${n + 4}" rx="3" fill="#fff"/><g fill="currentColor">${cells.join('')}${finder(0, 0)}${finder(n - 7, 0)}${finder(0, n - 7)}</g>
-    <g transform="translate(${mid - L / 2} ${mid - L / 2}) scale(${L / 64})"><rect width="64" height="64" rx="16" fill="#2F5BEA"/><rect x="13" y="20" width="24" height="24" rx="8" fill="none" stroke="#fff" stroke-width="5"/><rect x="27" y="20" width="24" height="24" rx="8" fill="none" stroke="#fff" stroke-opacity=".75" stroke-width="5"/></g></svg>`;
+    <g transform="translate(${mid - L / 2} ${mid - L / 2}) scale(${L / 64})"><rect width="64" height="64" rx="14" fill="#fff"/><image href="img/logo.png" x="3" y="3" width="58" height="58"/></g></svg>`;
 }
 const qrLink = () => `${APP_URL}#k=${me.code}`;
 function renderQR(el, size = 220) {
