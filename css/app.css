@@ -757,7 +757,9 @@ kbd { font: 600 11.5px var(--font); padding: 1px 6px; border-radius: 6px; border
   .toasts { left: 12px; right: 12px; bottom: calc(80px + env(safe-area-inset-bottom)); align-items: stretch; }
   .toast { max-width: none; min-width: 0; }
   .win { left: 8px !important; right: 8px; top: calc(60px + env(safe-area-inset-top)) !important; width: auto !important; max-width: none; resize: none; }
-  .win-local { left: auto !important; width: 46% !important; }
+  .win-local { left: auto !important; right: 8px !important; width: min(250px, 66vw) !important; }
+  .win-local .win-t small, .win-local [data-w="pip"], .win-local [data-w="full"] { display: none; }
+  .win-local .win-t b { font-size: 12px; }
   .f-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
   .clip-list { grid-template-columns: 1fr; }
   .settings { grid-template-columns: 1fr; }

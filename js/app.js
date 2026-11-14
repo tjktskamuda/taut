@@ -5,14 +5,14 @@ import {
   makeThumb, downloadBlob, shareBlob, makeZip, chime, audioCtx, loadScript,
   isObj, hasOwn, okKey, okUid, okCode, okId, dict, safeInt, cleanStr, cleanName, cleanFileName, safeMime, safeBlob, okThumb,
   enc, hex, unhex, randHex, b64, unb64,
-} from './util.js?v=1.1.0';
-import { icon, kindIcon, deviceIcon, logo, deviceArt } from './icons.js?v=1.1.0';
-import { Net, DEFAULT_SIGNAL, LIMITS } from './net.js?v=1.1.0';
+} from './util.js?v=1.1.1';
+import { icon, kindIcon, deviceIcon, logo, deviceArt } from './icons.js?v=1.1.1';
+import { Net, DEFAULT_SIGNAL, LIMITS } from './net.js?v=1.1.1';
 
 // Tolak dijalankan di dalam bingkai halaman lain (mencegah clickjacking pada tombol Izinkan)
 if (window.__tautFramed) throw new Error('Taut tidak boleh dibuka di dalam bingkai.');
 
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const PROTO = 2; // versi protokol jabat tangan
 const DEV_HOST = ['localhost', '127.0.0.1'].includes(location.hostname);
 const TYPES = new Set(['phone', 'tablet', 'laptop', 'desktop']);
