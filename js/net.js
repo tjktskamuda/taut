@@ -1,5 +1,5 @@
 // Taut — lapisan jaringan: server sinyal (protokol PeerJS) + WebRTC peer-to-peer
-import { uid } from './util.js?v=1.0.1';
+import { uid } from './util.js?v=1.0.2';
 
 export const PREFIX = 'taut-v1-';
 export const DEFAULT_SIGNAL = 'wss://0.peerjs.com:443/peerjs';
@@ -186,15 +186,19 @@ export class Link extends Emitter {
     this.dc = dc;
     dc.binaryType = 'arraybuffer';
     dc.bufferedAmountLowThreshold = 1024 * 1024;
-    dc.onopen = () => { this.state = 'open'; clearTimeout(this._to); this.emit('open'); };
+    const opened = () => {
+      if (this.state === 'open' || this.state === 'closed' || dc.readyState !== 'open') return;
+      this.state = 'open'; clearTimeout(this._to); this.emit('open');
+    };
+    dc.onopen = opened;
     dc.onclose = () => this.close('closed');
     dc.onerror = () => {};
     dc.onmessage = (e) => this._data(e.data);
-    if (dc.readyState === 'open') dc.onopen();
+    if (dc.readyState === 'open') setTimeout(opened, 0);
   }
   get open() { return this.state === 'open' && this.dc && this.dc.readyState === 'open'; }
   send(obj) {
-    if (this.open) { try { this.dc.send(JSON.stringify(obj)); return true; } catch { return false; } }
+    if (this.open) { try { this.dc.send(JSON.stringify(obj)); return true; } catch (e) { console.warn('kirim gagal', obj && obj.t, e); return false; } }
     return false;
   }
   close(reason = 'closed', silent = false) {

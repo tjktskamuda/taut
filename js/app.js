@@ -3,11 +3,11 @@ import {
   $, $$, sleep, uid, randomCode, esc, linkify, firstUrl, fmtSize, fmtSpeed, fmtTime, fmtAgo,
   detectDevice, isMacLike, isIOS, canShareScreen, canCamera, isStandalone, LS, idb, fileKind, extOf,
   makeThumb, downloadBlob, shareBlob, makeZip, chime, audioCtx, loadScript,
-} from './util.js?v=1.0.1';
-import { icon, kindIcon, deviceIcon, logo, deviceArt } from './icons.js?v=1.0.1';
-import { Net, DEFAULT_SIGNAL } from './net.js?v=1.0.1';
+} from './util.js?v=1.0.2';
+import { icon, kindIcon, deviceIcon, logo, deviceArt } from './icons.js?v=1.0.2';
+import { Net, DEFAULT_SIGNAL } from './net.js?v=1.0.2';
 
-const VERSION = '1.0.1';
+const VERSION = '1.0.2';
 const DEV = detectDevice();
 const APP_URL = location.origin + location.pathname.replace(/index\.html$/, '');
 const MOD = isMacLike() ? '⌘' : 'Ctrl';
@@ -153,12 +153,16 @@ function startConnect(code) {
 
 function onLinkOpen(l) {
   retries.delete(l.rid);
-  l.send(helloFull(l));
+  // Salam dikirim ulang sampai lawan mengonfirmasi (hello-ack)
+  let n = 0;
+  const say = () => { if (!l.helloAcked && l.open) l.send(helloFull(l)); };
+  say();
+  l._helloIv = setInterval(() => { if (l.helloAcked || l.state === 'closed' || ++n > 12) clearInterval(l._helloIv); else say(); }, 700);
   l._helloTimer = setTimeout(() => { if (!l.duid || !devOf(l.duid) || !devOf(l.duid).ready) l.close('nohello'); }, 12000);
 }
 
 function onLinkClose(l, reason, was) {
-  clearTimeout(l._helloTimer);
+  clearTimeout(l._helloTimer); clearInterval(l._helloIv);
   const d = [...S.devices.values()].find((x) => x.link === l);
   if (d) {
     d.link = null; d.ready = false; d.via = null; d.rtt = null; d.shared = [];
@@ -189,7 +193,8 @@ function onLinkClose(l, reason, was) {
 // Pesan kendali
 // ---------------------------------------------------------------------
 function onMsg(l, m) {
-  if (m.t === 'hello') return onHello(l, m);
+  if (m.t === 'hello-ack') { l.helloAcked = true; clearInterval(l._helloIv); return; }
+  if (m.t === 'hello') { l.send({ t: 'hello-ack' }); return onHello(l, m); }
   const duid = l.duid;
   if (!duid || !devOf(duid) || !devOf(duid).ready) {
     if (m.t !== 'pair' && m.t !== 'auth-fail') return;
@@ -232,8 +237,9 @@ function onMsg(l, m) {
 }
 
 function onHello(l, m) {
-  clearTimeout(l._helloTimer);
   if (!m.uid) { l.close('nohello'); return; }
+  if (l.duid === m.uid && devOf(m.uid) && devOf(m.uid).link === l && devOf(m.uid).ready) return; // salam ganda
+  clearTimeout(l._helloTimer);
   const tr = S.trusted[m.uid];
   let ok = true;
   if (tr && tr.key && m.key && tr.key !== m.key) ok = false;
