@@ -1,0 +1,24 @@
+{
+  "name": "Taut — Kit Kerja Lintas Perangkat",
+  "short_name": "Taut",
+  "description": "Hubungkan iPad, Windows, Mac, dan HP: transfer berkas, papan klip bersama, pencerminan layar, kamera bersama, dan catatan tersinkron.",
+  "lang": "id",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone"],
+  "orientation": "any",
+  "background_color": "#f2f4f8",
+  "theme_color": "#2f5bea",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "share_target": {
+    "action": "./?share",
+    "method": "GET",
+    "params": { "title": "title", "text": "text", "url": "url" }
+  }
+}
