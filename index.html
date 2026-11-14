@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss:; frame-src blob:; object-src 'self' blob:; worker-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
   <title>Taut — Kit Kerja Lintas Perangkat</title>
   <meta name="description" content="Hubungkan iPad, Windows, Mac, dan HP: transfer berkas, papan klip bersama, pencerminan layar, kamera bersama, dan catatan tersinkron — langsung dari browser.">
   <meta name="theme-color" content="#f2f4f8">
@@ -15,17 +17,9 @@
   <link rel="icon" href="icons/favicon.svg" type="image/svg+xml">
   <link rel="icon" href="icons/icon-192.png" sizes="192x192">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-  <link rel="stylesheet" href="css/app.css?v=1.0.2">
-  <script>
-    (function () {
-      try {
-        var s = JSON.parse(localStorage.getItem('taut.settings') || '{}');
-        var t = s.theme && s.theme !== 'auto' ? s.theme : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-        document.documentElement.dataset.theme = t;
-      } catch (e) {}
-    })();
-  </script>
-  <script src="lib/qrcode.js?v=1.0.2"></script>
+  <link rel="stylesheet" href="css/app.css?v=1.1.0">
+  <script src="js/boot.js?v=1.1.0"></script>
+  <script src="lib/qrcode.js?v=1.1.0"></script>
 </head>
 <body>
   <div class="bg-deco" aria-hidden="true"><i></i><i></i><i></i></div>
@@ -50,6 +44,6 @@
   <div id="overlays"></div>
   <div id="toasts" class="toasts" aria-live="polite"></div>
   <noscript><p style="padding:24px;font-family:sans-serif">Taut membutuhkan JavaScript.</p></noscript>
-  <script type="module" src="js/app.js?v=1.0.2"></script>
+  <script type="module" src="js/app.js?v=1.1.0"></script>
 </body>
 </html>

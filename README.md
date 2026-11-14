@@ -39,6 +39,16 @@ Plus: perangkat tepercaya tersambung otomatis, status baterai & kualitas jaringa
 - Mengendalikan mouse/keyboard komputer dari perangkat lain tidak dimungkinkan dari browser.
 - Di Safari, menyalin otomatis ke papan klip butuh satu ketukan (**Salin**) karena aturan keamanan Apple.
 
+## Keamanan
+
+- **Izin eksplisit.** Perangkat baru hanya bisa terhubung setelah Anda menekan **Izinkan**. Tautan/QR hanya mengisi kode; Anda tetap harus menekan **Hubungkan**.
+- **Verifikasi tanpa mengirim rahasia.** Saat dipasangkan, kedua perangkat menyimpan kunci rahasia 256-bit (sebagai kunci yang tidak bisa diekspor). Pada sambungan berikutnya, perangkat membuktikan kepemilikan kunci dengan HMAC yang terikat pada sidik jari sertifikat DTLS sambungan itu — kunci tidak pernah dikirim ulang, sehingga perangkat palsu yang mengambil alih kode tidak mendapat apa pun.
+- **Angka verifikasi** 4 digit muncul di kedua layar saat pemasangan; jika berbeda, ketuk **Lupakan**.
+- **Semua data dari perangkat lain divalidasi**: nama, ID, ukuran, tipe berkas, jalur folder, catatan, dan media. Berkas HTML/SVG tidak pernah dijalankan; berkas yang melebihi ukuran yang diumumkan ditolak.
+- **Layar & kamera** dari perangkat lain hanya tampil bila Anda memintanya atau mengizinkannya.
+- **Content-Security-Policy** ketat dan perlindungan dari pembingkaian (clickjacking).
+- Batasan: semua aplikasi di `tjktskamuda.github.io` berbagi satu origin browser, jadi aplikasi lain di alamat itu secara teknis bisa membaca data Taut di browser yang sama (kecuali kunci, yang tidak bisa diekspor). Untuk isolasi penuh, pasang Taut di domain/akun GitHub tersendiri.
+
 ## Teknis
 
 - HTML/CSS/JavaScript murni (tanpa build), PWA dengan service worker.

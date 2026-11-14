@@ -24,7 +24,7 @@ export function esc(s) {
 
 export function linkify(text) {
   const t = esc(text);
-  return t.replace(/(https?:\/\/[^\s<]+[^\s<.,;:!?)\]'"])/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+  return t.replace(/(https?:\/\/[^\s<]+[^\s<.,;:!?)\]'"])/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
 }
 
 export function firstUrl(text) {
@@ -109,11 +109,12 @@ function db() {
   if (!dbp) {
     dbp = new Promise((res, rej) => {
       let r;
-      try { r = indexedDB.open('taut', 1); } catch (e) { rej(e); return; }
+      try { r = indexedDB.open('taut', 2); } catch (e) { rej(e); return; }
       r.onupgradeneeded = () => {
         const d = r.result;
         if (!d.objectStoreNames.contains('files')) d.createObjectStore('files', { keyPath: 'id' });
         if (!d.objectStoreNames.contains('kv')) d.createObjectStore('kv');
+        if (!d.objectStoreNames.contains('keys')) d.createObjectStore('keys', { keyPath: 'uid' });
       };
       r.onsuccess = () => res(r.result);
       r.onerror = () => rej(r.error);
@@ -289,3 +290,53 @@ export function loadScript(src) {
     document.head.appendChild(s);
   });
 }
+
+// =====================================================================
+// VALIDASI & SANITASI DATA DARI PERANGKAT LAIN
+// Semua yang datang lewat jaringan dianggap tidak tepercaya.
+// =====================================================================
+export const RE_UID = /^[a-z0-9]{12,40}$/;
+export const RE_CODE = /^\d{6}$/;
+export const RE_ID = /^[A-Za-z0-9_-]{6,64}$/;
+const PROTO_KEYS = new Set(Object.getOwnPropertyNames(Object.prototype).concat(['__proto__', 'prototype', 'constructor']));
+export const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
+export const hasOwn = (o, k) => o != null && Object.prototype.hasOwnProperty.call(o, k);
+export const okKey = (k) => typeof k === 'string' && !PROTO_KEYS.has(k);
+export const okUid = (x) => typeof x === 'string' && RE_UID.test(x) && okKey(x);
+export const okCode = (x) => typeof x === 'string' && RE_CODE.test(x);
+export const okId = (x) => typeof x === 'string' && RE_ID.test(x) && okKey(x);
+export const dict = (o) => { const d = Object.create(null); if (isObj(o)) for (const k of Object.keys(o)) if (okKey(k)) d[k] = o[k]; return d; };
+export function safeInt(x, min, max) { return Number.isSafeInteger(x) && x >= min && x <= max ? x : null; }
+
+// buang karakter kendali & penimpa arah teks (trik menyamarkan ekstensi berkas)
+const CTRL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F؜‎‏‪-‮⁦-⁩]/g;
+export function cleanStr(x, max = 200) { return typeof x === 'string' ? x.replace(CTRL, '').slice(0, max) : ''; }
+export function cleanName(x, max = 40) { return cleanStr(x, max * 2).replace(/\s+/g, ' ').trim().slice(0, max); }
+export function cleanFileName(x) {
+  const s = cleanStr(x, 400).replace(/[\\/:*?"<>|\r\n\t]/g, '_').replace(/^[.\s]+/, '').trim().slice(0, 180);
+  return s || 'berkas';
+}
+export function cleanRel(x) {
+  if (typeof x !== 'string' || !x) return '';
+  const parts = x.split(/[\\/]+/).map((p) => cleanStr(p, 200).replace(/[:*?"<>|\r\n\t]/g, '_').trim().slice(0, 120)).filter((p) => p && !/^\.+$/.test(p));
+  return parts.slice(0, 24).join('/');
+}
+// Hanya tipe yang aman ditampilkan browser. HTML/SVG/XML/JS dipaksa menjadi biner/teks biasa
+// supaya tidak pernah dijalankan sebagai halaman dengan origin aplikasi.
+const SAFE_MIME = /^(image\/(png|jpeg|gif|webp|avif|bmp|heic|heif)|video\/(mp4|webm|quicktime|x-matroska|3gpp|x-m4v|ogg)|audio\/(mpeg|mp4|aac|ogg|wav|x-wav|webm|flac|x-m4a|opus)|application\/(pdf|zip|x-zip-compressed|x-7z-compressed|x-rar-compressed|vnd\.rar|gzip|x-tar|msword|rtf|vnd\.ms-excel|vnd\.ms-powerpoint|vnd\.openxmlformats-officedocument\.[a-z.]+|vnd\.oasis\.opendocument\.[a-z.]+|vnd\.android\.package-archive|octet-stream)|text\/(plain|csv))$/;
+export function safeMime(m) {
+  m = typeof m === 'string' ? m.toLowerCase().split(';')[0].trim() : '';
+  if (SAFE_MIME.test(m)) return m;
+  return m.startsWith('text/') || m === 'application/json' ? 'text/plain' : 'application/octet-stream';
+}
+export function safeBlob(b) { return b && safeMime(b.type) !== b.type ? new Blob([b], { type: safeMime(b.type) }) : b; }
+export const okThumb = (x) => typeof x === 'string' && x.length < 120000 && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/.test(x);
+
+// ---------- kriptografi kecil ----------
+const te = new TextEncoder();
+export const enc = (s) => te.encode(s);
+export const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
+export function unhex(h) { const a = new Uint8Array(h.length / 2); for (let i = 0; i < a.length; i++) a[i] = parseInt(h.substr(i * 2, 2), 16); return a; }
+export function randHex(n = 16) { const a = new Uint8Array(n); crypto.getRandomValues(a); return hex(a); }
+export const b64 = (u8) => btoa(String.fromCharCode(...u8));
+export function unb64(s) { try { if (typeof s !== 'string' || s.length > 200) return null; const t = atob(s); return Uint8Array.from(t, (c) => c.charCodeAt(0)); } catch { return null; } }

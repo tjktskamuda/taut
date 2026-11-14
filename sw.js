@@ -1,10 +1,10 @@
 // Taut — service worker: aplikasi tetap bisa dibuka walau koneksi tidak stabil
-const V = '1.0.2';
+const V = '1.1.0';
 const CACHE = 'taut-v' + V;
 const SHELL = [
   './', 'index.html', 'css/app.css?v=' + V, 'js/app.js?v=' + V, 'js/net.js?v=' + V, 'js/util.js?v=' + V, 'js/icons.js?v=' + V,
   'lib/qrcode.js?v=' + V, 'lib/jsQR.js', 'manifest.webmanifest',
-  'icons/favicon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
+  'js/boot.js?v=' + V, 'icons/favicon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
 ];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -18,7 +18,7 @@ self.addEventListener('fetch', (e) => {
   if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
   e.respondWith(
     fetch(req, { cache: 'no-cache' }).then((res) => {
-      if (res && res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
+      if (res && res.ok && res.type === 'basic') { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
       return res;
     }).catch(() => caches.match(req, { ignoreSearch: true }).then((r) => r || caches.match('index.html')))
   );

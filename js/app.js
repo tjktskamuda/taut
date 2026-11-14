@@ -3,11 +3,20 @@ import {
   $, $$, sleep, uid, randomCode, esc, linkify, firstUrl, fmtSize, fmtSpeed, fmtTime, fmtAgo,
   detectDevice, isMacLike, isIOS, canShareScreen, canCamera, isStandalone, LS, idb, fileKind, extOf,
   makeThumb, downloadBlob, shareBlob, makeZip, chime, audioCtx, loadScript,
-} from './util.js?v=1.0.2';
-import { icon, kindIcon, deviceIcon, logo, deviceArt } from './icons.js?v=1.0.2';
-import { Net, DEFAULT_SIGNAL } from './net.js?v=1.0.2';
+  isObj, hasOwn, okKey, okUid, okCode, okId, dict, safeInt, cleanStr, cleanName, cleanFileName, safeMime, safeBlob, okThumb,
+  enc, hex, unhex, randHex, b64, unb64,
+} from './util.js?v=1.1.0';
+import { icon, kindIcon, deviceIcon, logo, deviceArt } from './icons.js?v=1.1.0';
+import { Net, DEFAULT_SIGNAL, LIMITS } from './net.js?v=1.1.0';
 
-const VERSION = '1.0.2';
+// Tolak dijalankan di dalam bingkai halaman lain (mencegah clickjacking pada tombol Izinkan)
+if (window.__tautFramed) throw new Error('Taut tidak boleh dibuka di dalam bingkai.');
+
+const VERSION = '1.1.0';
+const PROTO = 2; // versi protokol jabat tangan
+const DEV_HOST = ['localhost', '127.0.0.1'].includes(location.hostname);
+const TYPES = new Set(['phone', 'tablet', 'laptop', 'desktop']);
+const OSES = new Set(['iPadOS', 'iOS', 'Android', 'Windows', 'macOS', 'ChromeOS', 'Linux', 'Lainnya']);
 const DEV = detectDevice();
 const APP_URL = location.origin + location.pathname.replace(/index\.html$/, '');
 const MOD = isMacLike() ? '⌘' : 'Ctrl';
@@ -18,23 +27,28 @@ const narrow = () => window.innerWidth < 720;
 // =====================================================================
 let firstRun = false;
 let me = LS.get('me');
-if (!me || !me.uid || !me.code) {
+if (!isObj(me) || !okUid(me.uid) || !okCode(me.code) || typeof me.token !== 'string') {
   me = { uid: uid(16), code: randomCode(), token: uid(20), name: DEV.label };
   firstRun = true;
 }
+me.name = cleanName(me.name, 40) || DEV.label;
 me.type = DEV.type; me.os = DEV.os;
 LS.set('me', me);
 
 const S = {
   settings: Object.assign({ theme: 'auto', autoConnect: true, clipAuto: false, clipAutoCopy: true, notify: false, signal: '', sound: true }, LS.get('settings', {})),
-  trusted: LS.get('trusted', {}),
+  trusted: loadTrusted(),
   devices: new Map(),
   page: 'home',
   sel: null,
-  tl: {},
-  clips: LS.get('clips', []),
-  notes: LS.get('notes', {}),
-  activity: LS.get('activity', []),
+  tl: Object.create(null),
+  clips: (Array.isArray(LS.get('clips')) ? LS.get('clips') : []).filter(isObj).slice(0, 80),
+  notes: loadNotes(),
+  activity: (Array.isArray(LS.get('activity')) ? LS.get('activity') : []).filter(isObj).slice(0, 40),
+  expect: new Map(),   // permintaan media yang kita kirim (duid|jenis -> batas waktu)
+  reqs: new Map(),     // permintaan sambungan yang sedang ditampilkan
+  cooldown: new Map(), // kode yang baru ditolak -> waktu
+  askCool: new Map(),
   myShared: [],
   received: [],
   sessions: new Map(),
@@ -50,6 +64,29 @@ const S = {
   filesTab: 'remote', filesFilter: 'all', filesDev: null,
   installEvt: null,
 };
+function loadTrusted() {
+  const out = Object.create(null);
+  const raw = LS.get('trusted', {});
+  if (!isObj(raw)) return out;
+  for (const [k, t] of Object.entries(raw)) {
+    if (!okUid(k) || !isObj(t) || !okCode(t.code)) continue;
+    out[k] = { uid: k, code: t.code, name: cleanName(t.name, 40) || 'Perangkat', type: TYPES.has(t.type) ? t.type : 'desktop', os: OSES.has(t.os) ? t.os : 'Lainnya', lastSeen: safeInt(t.lastSeen, 0, 9e15) || 0, needsPair: !!t.needsPair, legacy: typeof t.key === 'string' };
+  }
+  return out;
+}
+function loadNotes() {
+  const out = Object.create(null);
+  const raw = LS.get('notes', {});
+  if (isObj(raw)) for (const n of Object.values(raw)) { const v = vNote(n, true); if (v) out[v.id] = v; }
+  return out;
+}
+function vNote(n, local = false) {
+  if (!isObj(n) || !okId(n.id) || typeof n.body !== 'string' || n.body.length > 200000) return null;
+  let t = safeInt(n.updatedAt, 0, 9e15);
+  if (t === null) return null;
+  if (!local && t > Date.now() + 86400000) return null; // stempel waktu jauh di masa depan = menolak
+  return { id: n.id, body: n.body, updatedAt: t, deleted: n.deleted === true, pinned: n.pinned === true, by: cleanName(n.by, 40) };
+}
 const save = {
   me: () => LS.set('me', me),
   settings: () => LS.set('settings', S.settings),
@@ -60,25 +97,30 @@ const save = {
 };
 function debounce(f, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => f(...a), ms); }; }
 
-// Server sinyal: bisa diganti lewat ?signal= (untuk pengujian) atau pengaturan
+// Server sinyal: bawaan, atau alamat wss:// pilihan di Pengaturan.
+// Parameter ?signal= hanya berlaku di localhost (pengujian) dan tidak pernah disimpan.
 const qs = new URLSearchParams(location.search);
-if (qs.get('signal')) S.settings.signal = qs.get('signal');
-const SIGNAL_URL = S.settings.signal || DEFAULT_SIGNAL;
+const okSignal = (u) => typeof u === 'string' && /^wss:\/\/[a-z0-9.-]+(:\d{1,5})?(\/[A-Za-z0-9._~\/-]*)?$/i.test(u);
+if (S.settings.signal && !okSignal(S.settings.signal)) S.settings.signal = '';
+const SIGNAL_URL = (DEV_HOST && /^wss?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//.test(qs.get('signal') || '') && qs.get('signal')) || S.settings.signal || DEFAULT_SIGNAL;
 
 // =====================================================================
 // JARINGAN
 // =====================================================================
-const helloBase = () => ({ uid: me.uid, code: me.code, name: me.name, type: me.type, os: me.os, v: VERSION });
+// Salam singkat lewat server sinyal (tanpa rahasia apa pun)
+const helloBase = (l) => ({ uid: me.uid, code: me.code, name: me.name, type: me.type, os: me.os, v: VERSION, pv: PROTO, auto: !!(l && l.initiator && !l.manual) });
+const KEYS = new Map(); // uid -> CryptoKey HMAC (tidak bisa diekspor)
 const net = new Net({
   signalUrl: SIGNAL_URL,
   me,
   hello: helloBase,
-  isTrusted: (h) => !!(h && h.uid && S.trusted[h.uid]),
+  isTrusted: (h) => isObj(h) && okUid(h.uid) && hasOwn(S.trusted, h.uid) && KEYS.has(h.uid) && !S.trusted[h.uid].needsPair,
 });
 net.sinkFor = (r) => (S.dirHandle && r.purpose === 'transfer' ? openSink(r) : null);
+net.mediaGate = (l, ms) => mediaGate(l, ms);
 
 net.signal.on('state', () => refresh('status'));
-net.signal.on('open', () => { connectTrusted(); if (pendingHashCode) { const c = pendingHashCode; pendingHashCode = null; startConnect(c); } });
+net.signal.on('open', () => { connectTrusted(); });
 net.signal.on('idtaken', () => {
   me.code = randomCode(); me.token = uid(20); save.me();
   net.signal.restart(me.code, me.token);
@@ -95,26 +137,60 @@ net.on('rx', (l, r) => onRx(l, r));
 net.on('media', (l, ms) => onMedia(l, ms));
 net.on('media-end', (l, ms, remote) => onMediaEnd(l, ms, remote));
 
-const fmtCode = (c) => String(c).replace(/(\d{3})(\d{3})/, '$1 $2');
+const fmtCode = (c) => String(c).replace(/\D/g, '').slice(0, 6).replace(/(\d{3})(\d{3})/, '$1 $2');
 const devOf = (duid) => S.devices.get(duid);
-const devName = (duid) => (devOf(duid) && devOf(duid).name) || (S.trusted[duid] && S.trusted[duid].name) || 'Perangkat';
-const connected = () => [...S.devices.values()].filter((d) => d.ready && d.link && d.link.open);
-const linkOf = (duid) => { const d = devOf(duid); return d && d.ready && d.link && d.link.open ? d.link : null; };
+const trustOf = (duid) => (okKey(duid) && hasOwn(S.trusted, duid) ? S.trusted[duid] : null);
+const devName = (duid) => (devOf(duid) && devOf(duid).name) || (trustOf(duid) && trustOf(duid).name) || 'Perangkat';
+const connected = () => [...S.devices.values()].filter((d) => d.ready && d.link && d.link.open && d.link.active);
+const linkOf = (duid) => { const d = devOf(duid); return d && d.ready && d.link && d.link.open && d.link.active ? d.link : null; };
 const featuresOf = () => ({ screen: canShareScreen(), camera: canCamera() });
 
-function helloFull(l) {
-  const ruid = l.remoteHello && l.remoteHello.uid;
-  return {
-    t: 'hello', ...helloBase(), battery: S.battery, features: featuresOf(),
-    key: (ruid && S.trusted[ruid] && S.trusted[ruid].key) || null,
-    shared: sharedMeta(),
-  };
+// Salam di kanal data terenkripsi. Tidak memuat kunci; hanya nonce & penanda kepemilikan kunci.
+function helloMsg(l) {
+  const ruid = isObj(l.remoteHello) && okUid(l.remoteHello.uid) ? l.remoteHello.uid : null;
+  return { t: 'hello', uid: me.uid, code: me.code, name: me.name, type: me.type, os: me.os, v: VERSION, pv: PROTO, nonce: l.nonce, hasKey: !!(ruid && KEYS.has(ruid)), features: featuresOf() };
 }
+
+// ---------- Kunci perangkat tepercaya ----------
+async function loadKeys() {
+  try {
+    for (const r of await idb.all('keys')) {
+      if (r && okUid(r.uid) && r.key && hasOwn(S.trusted, r.uid)) KEYS.set(r.uid, r.key);
+      else if (r && typeof r.uid === 'string') idb.del('keys', r.uid).catch(() => {}); // kunci yatim: hapus
+    }
+  } catch {}
+  for (const t of Object.values(S.trusted)) {
+    const fb = LS.get('k.' + t.uid);
+    if (!KEYS.has(t.uid) && typeof fb === 'string') { const raw = unb64(fb); if (raw && raw.length === 32) { try { KEYS.set(t.uid, await importKey(raw)); } catch {} } }
+    if (!KEYS.has(t.uid)) t.needsPair = true; // data versi lama / kunci hilang: perlu dipasangkan ulang
+    delete t.legacy;
+  }
+  save.trusted();
+}
+function importKey(raw) { return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']); }
+async function setKey(duid, raw) {
+  const k = await importKey(raw);
+  KEYS.set(duid, k);
+  try { await idb.put('keys', { uid: duid, key: k }); LS.del('k.' + duid); }
+  catch { LS.set('k.' + duid, b64(raw)); } // cadangan bila browser tidak bisa menyimpan CryptoKey
+}
+async function delKey(duid) { KEYS.delete(duid); LS.del('k.' + duid); try { await idb.del('keys', duid); } catch {} }
+function transcript(l) {
+  const [a, b] = l.fingerprints();
+  if (!a || !b || !l.peer) return null;
+  return 'taut-auth-v2|' + [a, b].sort().join('|') + '|' + [l.nonce, l.peer.nonce].sort().join('|');
+}
+async function hmacHex(key, text) { return hex(await crypto.subtle.sign('HMAC', key, enc(text))); }
+async function sasOf(l) {
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', enc('taut-sas|' + l.T)));
+  return String(((d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3]) >>> 0).slice(-4).padStart(4, '0');
+}
+function markNeedsPair(duid) { const t = trustOf(duid); if (t && !t.needsPair) { t.needsPair = true; save.trusted(); refresh('settings'); } }
 
 function connectTrusted() {
   if (!S.settings.autoConnect || net.signal.state !== 'online') return;
   for (const t of Object.values(S.trusted)) {
-    if (!t.code) continue;
+    if (!t.code || t.needsPair || !KEYS.has(t.uid)) continue;
     const d = devOf(t.uid);
     if (d && d.ready) continue;
     const ex = net.links.get(t.code);
@@ -145,7 +221,7 @@ function startConnect(code) {
   const d = [...S.devices.values()].find((x) => x.code === code && x.ready);
   if (d) { setConnStatus('ok', `${esc(d.name)} sudah terhubung.`); return; }
   if (net.signal.state !== 'online') { setConnStatus('err', 'Belum tersambung ke server. Periksa koneksi internet perangkat ini.'); net.signal.kick(); return; }
-  const l = net.connect(code, { waitMs: 60000 });
+  const l = net.connect(code, { waitMs: 60000, manual: true });
   if (!l) return;
   S.connecting = l;
   setConnStatus('wait', `Menghubungkan ke ${fmtCode(code)}… Ketuk <b>Izinkan</b> di perangkat tersebut.`, true);
@@ -153,23 +229,31 @@ function startConnect(code) {
 
 function onLinkOpen(l) {
   retries.delete(l.rid);
+  l.nonce = randHex(16);
   // Salam dikirim ulang sampai lawan mengonfirmasi (hello-ack)
   let n = 0;
-  const say = () => { if (!l.helloAcked && l.open) l.send(helloFull(l)); };
+  const say = () => { if (!l.helloAcked && l.open) l.send(helloMsg(l)); };
   say();
   l._helloIv = setInterval(() => { if (l.helloAcked || l.state === 'closed' || ++n > 12) clearInterval(l._helloIv); else say(); }, 700);
-  l._helloTimer = setTimeout(() => { if (!l.duid || !devOf(l.duid) || !devOf(l.duid).ready) l.close('nohello'); }, 12000);
+  armTimer(l, 15000);
+}
+// Sambungan yang tidak lolos verifikasi dalam batas waktu akan ditutup
+function armTimer(l, ms) {
+  clearTimeout(l._helloTimer);
+  l._helloTimer = setTimeout(() => { if (!l.active) l.close('nohello'); }, ms);
 }
 
 function onLinkClose(l, reason, was) {
   clearTimeout(l._helloTimer); clearInterval(l._helloIv);
+  if (l.peer) closeModal('rp-' + l.peer.uid);
+  for (const k of [...modals.keys()]) if (k.startsWith('mg-') && modals.get(k).link === l) closeModal(k);
   const d = [...S.devices.values()].find((x) => x.link === l);
   if (d) {
     d.link = null; d.ready = false; d.via = null; d.rtt = null; d.shared = [];
     for (const s of [...S.sessions.values()]) if (s.link === l) endSession(s.sid, false);
-    if (was === 'open' && reason !== 'bye' && reason !== 'auth') toast(`${esc(d.name)} terputus`, { icon: 'unlink' });
+    if (was === 'open' && l.active && !['bye', 'auth', 'replaced', 'bye-local'].includes(reason)) toast(`${esc(d.name)} terputus`, { icon: 'unlink' });
     if (reason === 'bye') toast(`${esc(d.name)} memutuskan sambungan`, { icon: 'unlink' });
-    addActivity('unlink', `Terputus dari ${d.name}`);
+    if (l.active) addActivity('unlink', `Terputus dari ${d.name}`);
   }
   if (S.connecting === l) {
     S.connecting = null;
@@ -180,90 +264,202 @@ function onLinkClose(l, reason, was) {
       failed: 'Sambungan gagal. Coba sambungkan kedua perangkat ke Wi-Fi yang sama.',
       nosignal: 'Tidak tersambung ke server sinyal.',
       cancel: 'Dibatalkan.',
+      auth: 'Verifikasi perangkat gagal. Lupakan perangkat ini di kedua sisi, lalu pasangkan ulang.',
+      version: 'Perangkat tersebut memakai versi Taut yang berbeda. Muat ulang Taut di kedua perangkat.',
+      badhello: 'Perangkat tersebut mengirim data yang tidak valid.',
+      nohello: 'Perangkat tidak merespons verifikasi.',
     }[reason] || 'Sambungan gagal dibuat.';
     if (reason !== 'replaced') setConnStatus('err', msg);
   }
   const t = Object.values(S.trusted).find((x) => x.code === l.rid);
+  if (t && l.initiator && !l.manual && reason === 'rejected') markNeedsPair(t.uid);
   const lost = ['failed', 'lost', 'closed', 'timeout', 'nohello'].includes(reason);
-  if (t && S.settings.autoConnect && ((was === 'open' && lost) || (l.retry && ['offline', 'timeout', 'failed'].includes(reason)))) scheduleReconnect(l.rid);
+  if (t && !t.needsPair && S.settings.autoConnect && ((was === 'open' && l.active && lost) || (l.retry && ['offline', 'timeout', 'failed'].includes(reason)))) scheduleReconnect(l.rid);
   refresh('devices');
 }
 
 // ---------------------------------------------------------------------
-// Pesan kendali
+// Pesan kendali — diproses berurutan per sambungan
 // ---------------------------------------------------------------------
 function onMsg(l, m) {
-  if (m.t === 'hello-ack') { l.helloAcked = true; clearInterval(l._helloIv); return; }
-  if (m.t === 'hello') { l.send({ t: 'hello-ack' }); return onHello(l, m); }
-  const duid = l.duid;
-  if (!duid || !devOf(duid) || !devOf(duid).ready) {
-    if (m.t !== 'pair' && m.t !== 'auth-fail') return;
-  }
-  const d = devOf(duid);
+  l._q = (l._q || Promise.resolve()).then(() => handleMsg(l, m)).catch((e) => console.warn('pesan', e));
+}
+async function handleMsg(l, m) {
+  if (l.state === 'closed') return;
   switch (m.t) {
-    case 'pair':
-      if (S.trusted[duid]) { S.trusted[duid].key = m.key; save.trusted(); }
-      break;
+    case 'hello-ack': l.helloAcked = true; clearInterval(l._helloIv); return;
+    case 'hello': l.send({ t: 'hello-ack' }); return onHello(l, m);
+    case 'auth': return onAuth(l, m);
+    case 'pair': return onPair(l, m);
+    case 'ready': l.peerReady = true; if (l.authed) activate(l); return;
     case 'auth-fail':
-      toast('Verifikasi perangkat gagal. Hubungkan ulang dengan kode.', { icon: 'shield' });
-      if (S.trusted[duid]) { delete S.trusted[duid]; save.trusted(); }
-      l.close('auth');
+      if (l.peer && !l.active) markNeedsPair(l.peer.uid);
+      if (!l.quiet) toast('Perangkat lain gagal memverifikasi perangkat ini. Pasangkan ulang bila perlu.', { icon: 'shield' });
+      l.close('auth'); return;
+    case 'bye': l.close('bye'); return;
+    default: break;
+  }
+  if (!l.active) return; // selain jabat tangan, semua pesan butuh sambungan terverifikasi
+  const duid = l.duid;
+  const d = devOf(duid);
+  if (!d) return;
+  switch (m.t) {
+    case 'info': {
+      const nm = cleanName(m.name, 40);
+      if (nm) { d.name = nm; const t = trustOf(duid); if (t) { t.name = nm; save.trusted(); } }
+      if (isObj(m.battery)) { const lv = safeInt(m.battery.level, 0, 100); d.battery = lv === null ? null : { level: lv, charging: m.battery.charging === true }; }
+      refresh(nm ? 'devices' : 'stats');
       break;
-    case 'info':
-      if (m.name) { d.name = m.name; if (S.trusted[duid]) { S.trusted[duid].name = m.name; save.trusted(); } }
-      if ('battery' in m) d.battery = m.battery;
-      refresh(m.name ? 'devices' : 'stats');
-      break;
-    case 'bye': l.close('bye'); break;
+    }
     case 'forget':
-      if (S.trusted[duid]) { delete S.trusted[duid]; save.trusted(); }
+      if (trustOf(duid)) { delete S.trusted[duid]; save.trusted(); }
+      delKey(duid);
       break;
     case 'text': recvText(duid, m); break;
     case 'clip': recvClip(duid, m); break;
-    case 'notes-all': for (const n of m.notes || []) mergeNote(n, l); refresh('notes'); break;
+    case 'notes-all': if (Array.isArray(m.notes)) { for (const n of m.notes.slice(0, 5000)) mergeNote(n, l); refresh('notes'); } break;
     case 'note': mergeNote(m.note, l); refresh('notes'); break;
-    case 'shared': d.shared = m.items || []; refresh('files'); break;
-    case 'share-get': serveShared(l, m.id); break;
-    case 'batch-cancel': for (const t of [...l.queue, ...l.tx.values()]) if (t.batch === m.batch) l.cancel(t); break;
-    case 'scr-req': askMedia(duid, 'screen'); break;
-    case 'cam-req': askMedia(duid, 'camera', m.facing); break;
-    case 'media-deny': toast(`${esc(d.name)} menolak permintaan ${m.kind === 'screen' ? 'layar' : 'kamera'}.`, { icon: 'x' }); break;
-    case 'cam-flip': flipCamera(m.sid); break;
-    case 'cam-facing': { const s = S.sessions.get(m.sid); if (s) { s.facing = m.facing; s.mirror = m.facing === 'user'; applyMirror(s); } break; }
-    case 'ring': startRing(duid); break;
-    case 'ring-stop': stopRing(true); break;
+    case 'shared': d.shared = vSharedList(m.items); refresh('files'); break;
+    case 'share-get': if (okId(m.id)) serveShared(l, m.id); break;
+    case 'batch-cancel': if (okId(m.batch)) for (const t of [...l.queue, ...l.tx.values()]) if (t.batch === m.batch) l.cancel(t); break;
+    case 'scr-req': askMedia(l, 'screen'); break;
+    case 'cam-req': askMedia(l, 'camera', m.facing === 'user' ? 'user' : 'environment'); break;
+    case 'media-deny': if (m.kind === 'screen' || m.kind === 'camera') toast(`${esc(d.name)} menolak permintaan ${m.kind === 'screen' ? 'layar' : 'kamera'}.`, { icon: 'x' }); break;
+    case 'cam-flip': { const s = okId(m.sid) && S.sessions.get(m.sid); if (s && s.link === l && s.dir === 'out') flipCamera(m.sid); break; }
+    case 'cam-facing': { const s = okId(m.sid) && S.sessions.get(m.sid); if (s && s.link === l && s.dir === 'in') { s.facing = m.facing === 'user' ? 'user' : 'environment'; s.mirror = s.facing === 'user'; applyMirror(s); } break; }
+    case 'ring': if (!ringTimer) startRing(duid); break;
+    case 'ring-stop': if (ringFrom === duid) stopRing(); break;
     default: break;
   }
 }
 
-function onHello(l, m) {
-  if (!m.uid) { l.close('nohello'); return; }
-  if (l.duid === m.uid && devOf(m.uid) && devOf(m.uid).link === l && devOf(m.uid).ready) return; // salam ganda
-  clearTimeout(l._helloTimer);
-  const tr = S.trusted[m.uid];
-  let ok = true;
-  if (tr && tr.key && m.key && tr.key !== m.key) ok = false;
-  if (l.autoAccepted && (!tr || (tr.key && m.key !== tr.key))) ok = false;
-  if (!ok) { l.send({ t: 'auth-fail' }); setTimeout(() => l.close('auth'), 200); toast('Sambungan ditolak: verifikasi perangkat gagal.', { icon: 'shield' }); return; }
-  // tutup sambungan lama ke perangkat yang sama
-  const old = devOf(m.uid);
-  if (old && old.link && old.link !== l) { const ol = old.link; old.link = null; ol.close('replaced', true); }
-  l.duid = m.uid;
-  const d = old || { uid: m.uid, shared: [] };
-  Object.assign(d, {
-    uid: m.uid, code: m.code, name: m.name || 'Perangkat', type: m.type || 'desktop', os: m.os || '',
-    features: m.features || {}, battery: m.battery || null, shared: m.shared || [], link: l, ready: true, since: Date.now(),
+function vHello(m) {
+  if (!okUid(m.uid) || !okCode(m.code) || typeof m.nonce !== 'string' || !/^[0-9a-f]{32}$/.test(m.nonce)) return null;
+  const f = isObj(m.features) ? m.features : {};
+  return {
+    uid: m.uid, code: m.code, name: cleanName(m.name, 40) || 'Perangkat', type: TYPES.has(m.type) ? m.type : 'desktop',
+    os: OSES.has(m.os) ? m.os : 'Lainnya', v: cleanStr(m.v, 12), pv: m.pv, nonce: m.nonce, hasKey: m.hasKey === true,
+    features: { screen: f.screen === true, camera: f.camera === true },
+  };
+}
+
+// 1) Salam diterima: tentukan verifikasi (perangkat tepercaya) atau pemasangan baru
+async function onHello(l, m) {
+  if (l.peer) return; // salam ganda
+  const h = vHello(m);
+  if (!h || h.code !== l.rid || h.uid === me.uid) { l.close('badhello'); return; }
+  if (h.pv !== PROTO) {
+    if (!l.quiet) toast(`${esc(h.name)} memakai versi Taut lain. Muat ulang Taut di perangkat tersebut.`, { icon: 'refresh', timeout: 8000 });
+    l.close('version'); return;
+  }
+  const rh = l.remoteHello;
+  if (isObj(rh) && rh.uid !== undefined && rh.uid !== h.uid) { l.close('badhello'); return; } // identitas berubah di tengah jalan
+  if (!crypto.subtle) { toast('Browser ini tidak mendukung verifikasi aman (butuh HTTPS).', { icon: 'shield' }); l.close('badhello'); return; }
+  l.peer = h; l.duid = h.uid;
+  l.T = transcript(l);
+  if (!l.T) { l.close('badhello'); return; }
+  const K = KEYS.get(h.uid);
+  if (K && h.hasKey) {
+    // Perangkat tepercaya: buktikan kepemilikan kunci tanpa mengirim kunci (HMAC terikat sidik jari DTLS)
+    l.mode = 'auth';
+    l.send({ t: 'auth', proof: await hmacHex(K, l.T + '|' + me.uid) });
+    if (l.pendingAuth) { const pa = l.pendingAuth; l.pendingAuth = null; await onAuth(l, pa); }
+    return;
+  }
+  if (l.manual || l.approved) return beginPair(l);
+  if (l.autoAccepted) return askRepair(l);
+  // sambungan otomatis tanpa kunci yang cocok: jangan pernah memasangkan diam-diam
+  markNeedsPair(h.uid);
+  l.close('needpair');
+}
+async function onAuth(l, m) {
+  if (!l.peer) { l.pendingAuth = m; return; }
+  if (l.mode !== 'auth' || l.authed) return;
+  const K = KEYS.get(l.peer.uid);
+  let ok = false;
+  try { ok = !!K && typeof m.proof === 'string' && /^[0-9a-f]{64}$/.test(m.proof) && await crypto.subtle.verify('HMAC', K, unhex(m.proof), enc(l.T + '|' + l.peer.uid)); } catch { ok = false; }
+  if (!ok) {
+    l.send({ t: 'auth-fail' });
+    markNeedsPair(l.peer.uid);
+    if (!l.quiet) toast(`Verifikasi ${esc(l.peer.name)} gagal. Sambungan ditolak.`, { icon: 'shield', timeout: 8000 });
+    l.close('auth'); return;
+  }
+  setAuthed(l, false);
+}
+// 2) Pemasangan baru — hanya bila pengguna mengizinkan (penerima) atau memulai sendiri (pengirim)
+async function beginPair(l) {
+  l.mode = 'pair';
+  if (!l.initiator) {
+    const raw = crypto.getRandomValues(new Uint8Array(32));
+    await setKey(l.peer.uid, raw);
+    l.send({ t: 'pair', key: b64(raw) }); // dikirim lewat kanal DTLS yang sudah terenkripsi
+    raw.fill(0);
+    setAuthed(l, true);
+  } else {
+    l.awaitPair = true;
+    armTimer(l, 75000);
+    if (l.pendingPair) { const p = l.pendingPair; l.pendingPair = null; await onPair(l, p); }
+  }
+}
+async function onPair(l, m) {
+  if (!l.peer) { l.pendingPair = m; return; }
+  if (!l.initiator || !l.awaitPair || l.authed) return;
+  const raw = unb64(m.key);
+  if (!raw || raw.length !== 32) { l.close('badhello'); return; }
+  await setKey(l.peer.uid, raw);
+  raw.fill(0);
+  setAuthed(l, true);
+}
+// Perangkat mengaku tepercaya tetapi kehilangan kuncinya: minta izin pengguna
+function askRepair(l) {
+  const h = l.peer;
+  armTimer(l, 75000);
+  if (S.settings.sound) chime();
+  let done = false;
+  modal({
+    id: 'rp-' + h.uid, icon: 'shield', title: 'Pasangkan ulang perangkat?', dismiss: false,
+    body: `<div class="req-card"><div class="req-art">${deviceArt(h.type)}</div><div><b class="rc-name">${esc(h.name)}</b><small>${esc(h.os)} · Kode ${fmtCode(l.rid)}</small><p>Perangkat ini tidak lagi memiliki kunci pemasangan (mungkin datanya dihapus). Izinkan hanya jika Anda yakin ini perangkat Anda.</p></div></div>`,
+    actions: [
+      { label: 'Tolak', fn: () => { done = true; l.close('rejected'); } },
+      { label: 'Pasangkan ulang', primary: true, fn: () => { done = true; l.approved = true; l._q = l._q.then(() => beginPair(l)).catch(() => {}); } },
+    ],
+    onClose: () => { if (!done) l.close('rejected'); },
   });
-  S.devices.set(m.uid, d);
-  let key = (tr && tr.key) || m.key || null;
-  if (!key && !l.initiator) { key = uid(24); l.send({ t: 'pair', key }); }
-  S.trusted[m.uid] = { uid: m.uid, code: m.code, name: d.name, type: d.type, os: d.os, key, lastSeen: Date.now() };
+}
+function setAuthed(l, fresh) {
+  l.authed = true; l.fresh = fresh;
+  l.send({ t: 'ready' });
+  if (l.peerReady) activate(l);
+}
+// 3) Kedua sisi terverifikasi: perangkat resmi terhubung
+async function activate(l) {
+  if (l.active || l.state === 'closed') return;
+  l.active = true;
+  clearTimeout(l._helloTimer);
+  const h = l.peer;
+  const old = devOf(h.uid);
+  if (old && old.link && old.link !== l) { const ol = old.link; old.link = null; ol.close('replaced'); }
+  const d = old || { uid: h.uid, shared: [] };
+  Object.assign(d, {
+    uid: h.uid, code: h.code, name: h.name, type: h.type, os: h.os,
+    features: h.features, battery: null, shared: [], link: l, ready: true, since: Date.now(),
+  });
+  S.devices.set(h.uid, d);
+  S.trusted[h.uid] = { uid: h.uid, code: h.code, name: h.name, type: h.type, os: h.os, lastSeen: Date.now(), needsPair: false };
   save.trusted();
-  if (!S.sel || !devOf(S.sel) || !devOf(S.sel).ready) S.sel = m.uid;
-  if (!S.filesDev || !devOf(S.filesDev) || !devOf(S.filesDev).ready) S.filesDev = m.uid;
+  if (!S.sel || !devOf(S.sel) || !devOf(S.sel).ready) S.sel = h.uid;
+  if (!S.filesDev || !devOf(S.filesDev) || !devOf(S.filesDev).ready) S.filesDev = h.uid;
   l.send({ t: 'notes-all', notes: Object.values(S.notes) });
+  l.send({ t: 'shared', items: sharedMeta() });
+  if (S.battery) l.send({ t: 'info', battery: S.battery });
   if (S.connecting === l) { S.connecting = null; closeModal('connect'); }
-  if (!l.auto || !l.retry) toast(`${esc(d.name)} terhubung`, { icon: 'check', kind: 'ok' });
+  if (l.fresh) {
+    const sas = await sasOf(l);
+    toast(`<b>${esc(d.name)} terpasang</b><br>Angka verifikasi <b class="sas">${sas}</b> — pastikan sama di kedua perangkat. Jika berbeda, ketuk Lupakan.`, {
+      icon: 'shield', kind: 'ok', timeout: 15000,
+      actions: [{ label: 'Lupakan', fn: () => ACT.forget({ dataset: { uid: h.uid } }) }],
+    });
+  } else if (!l.auto || !l.retry) toast(`${esc(d.name)} terhubung`, { icon: 'check', kind: 'ok' });
   if (S.settings.sound) chime();
   addActivity('link', `Terhubung dengan ${d.name}`);
   updateStats(d);
@@ -271,14 +467,15 @@ function onHello(l, m) {
     const txt = S.pendingShare; S.pendingShare = null;
     setTimeout(() => pickDevice('Kirim yang dibagikan', 'share', (u) => { sendText(u, txt); toast('Terkirim ke ' + esc(devName(u)), { icon: 'check', kind: 'ok' }); }), 400);
   }
-  refresh('devices');
+  refresh('devices'); refresh('settings');
 }
 
 // =====================================================================
 // TIMELINE (Transfer Bebas)
 // =====================================================================
 function tl(duid) {
-  if (!S.tl[duid]) S.tl[duid] = LS.get('tl.' + duid, []);
+  if (!okKey(duid)) return [];
+  if (!hasOwn(S.tl, duid)) { const a = LS.get('tl.' + duid, []); S.tl[duid] = Array.isArray(a) ? a.filter((x) => isObj(x) && okId(x.id)) : []; }
   return S.tl[duid];
 }
 const saveTLs = {};
@@ -308,7 +505,10 @@ function sendText(duid, text) {
   tlPush(duid, { id, dir: 'out', kind: 'text', text, ts: Date.now() });
 }
 function recvText(duid, m) {
-  tlPush(duid, { id: m.id || uid(), dir: 'in', kind: 'text', text: m.text, ts: Date.now() });
+  if (typeof m.text !== 'string' || !m.text.trim() || m.text.length > 200000) return;
+  const id = 'r-' + (okId(m.id) ? m.id : uid());
+  if (tlFind(duid, id)) return; // pesan ganda
+  tlPush(duid, { id, dir: 'in', kind: 'text', text: m.text, ts: Date.now() });
   const url = firstUrl(m.text);
   addActivity(url ? 'link' : 'text', `${devName(duid)}: ${m.text.slice(0, 60)}`);
   notify(devName(duid), m.text);
@@ -348,7 +548,7 @@ function sendFiles(duid, list) {
 
 function onTx(l, t) {
   const duid = l.duid;
-  if (!duid) return;
+  if (!duid || !l.active) return;
   if (t.purpose === 'clip' || t.purpose === 'share') return;
   if (t.batch) {
     const it = tlFind(duid, t.batch);
@@ -375,24 +575,33 @@ function onTx(l, t) {
 
 function onRx(l, r) {
   const duid = l.duid;
-  if (!duid) return;
+  if (!duid || !l.active) return;
+  if (!r.fid) r.fid = uid(); // ID penyimpanan lokal — tidak pernah memakai ID dari perangkat lain
+  if (r.state === 'finishing') return;
+  if (r.reason === 'toolarge' && !r._warned) {
+    r._warned = true;
+    toast(`<b>${esc(r.name)}</b> (${fmtSize(r.size)}) terlalu besar untuk ditampung browser.${window.showDirectoryPicker ? ' Aktifkan <b>Simpan otomatis ke folder</b> di Pengaturan, lalu kirim ulang.' : ' Kirim berkas yang lebih kecil.'}`, { icon: 'info', timeout: 9000 });
+  }
   if (r.purpose === 'clip') {
     if (r.state === 'done' && r.blob) recvClipImage(duid, r);
     return;
   }
   // transfer & berkas bersama
   if (r.batch) {
-    let it = tlFind(duid, r.batch);
+    l.batchMap = l.batchMap || new Map();
+    let bid = l.batchMap.get(r.batch);
+    if (!bid) { bid = 'r-' + r.batch; if (tlFind(duid, bid)) bid = 'r-' + uid(); l.batchMap.set(r.batch, bid); }
+    let it = tlFind(duid, bid);
     if (!it) {
       const ex = r.extra || {};
-      it = { id: r.batch, dir: 'in', kind: 'batch', name: ex.bname || 'Folder', count: ex.bcount || 1, size: ex.bsize || r.size, ts: Date.now(), state: 'receiving', doneCount: 0, doneBytes: 0, files: [] };
+      it = { id: bid, rbatch: r.batch, dir: 'in', kind: 'batch', name: ex.bname || 'Folder', count: ex.bcount || 1, size: ex.bsize || r.size, ts: Date.now(), state: 'receiving', doneCount: 0, doneBytes: 0, files: [] };
       tlPush(duid, it);
       addActivity('folder', `Menerima folder "${it.name}" dari ${devName(duid)}`);
     }
     S.live.set(it.id, { l, batch: true, in: true });
     if (r.state === 'done' && !r._c) {
       r._c = 1; it.doneCount++; it.doneBytes += r.size;
-      it.files.push({ fid: r.id, name: r.name, size: r.size, mime: r.mime, rel: r.rel, disk: !!r.savedToDisk });
+      if (it.files.length < 100000) it.files.push({ fid: r.fid, name: r.name, size: r.size, mime: r.mime, rel: r.rel, disk: !!r.savedToDisk });
       if (r.blob) storeReceived(r, duid);
     }
     if (r.state === 'failed' || r.state === 'cancelled') it.state = r.state;
@@ -405,9 +614,12 @@ function onRx(l, r) {
     if (r.state !== 'receiving') { saveTL(duid); updateItem(duid, it); }
     return;
   }
-  let it = tlFind(duid, r.id);
+  let it = r.iid ? tlFind(duid, r.iid) : null;
   if (!it) {
-    it = { id: r.id, dir: 'in', kind: 'file', fid: r.id, name: r.name, size: r.size, mime: r.mime, ts: Date.now(), state: 'receiving' };
+    let iid = 'r-' + r.id;
+    if (tlFind(duid, iid)) iid = 'r-' + uid(); // ID dipakai ulang: jangan menimpa entri lama
+    r.iid = iid;
+    it = { id: iid, dir: 'in', kind: 'file', fid: r.fid, name: r.name, size: r.size, mime: r.mime, ts: Date.now(), state: 'receiving' };
     if (r.purpose === 'share') it.fromShare = true;
     tlPush(duid, it);
   }
@@ -425,7 +637,7 @@ function onRx(l, r) {
     if (S.page !== 'transfer' || S.sel !== duid) {
       toast(`<b>${esc(r.name)}</b><br>dari ${esc(devName(duid))} · ${fmtSize(r.size)}`, {
         icon: kindIcon(k), timeout: 6000,
-        actions: r.blob ? [{ label: 'Buka', fn: () => preview(r.id) }, { label: 'Simpan', fn: () => saveFile(r.id) }] : [],
+        actions: r.blob ? [{ label: 'Buka', fn: () => preview(r.fid) }, { label: 'Simpan', fn: () => saveFile(r.fid) }] : [],
       });
     }
   }
@@ -434,9 +646,14 @@ function onRx(l, r) {
 }
 
 async function storeReceived(r, duid, origin = 'recv') {
-  const rec = { id: r.id, blob: r.blob, name: r.name, mime: r.mime || r.blob.type, size: r.size, from: duid, fromName: devName(duid), ts: Date.now(), origin, rel: r.rel || '', batch: r.batch || null };
-  S.blobs.set(r.id, r.blob);
-  try { await idb.put('files', rec); } catch (e) { console.warn('IDB penuh/gagal', e); }
+  const fid = r.fid || (r.fid = uid());
+  const blob = safeBlob(r.blob);
+  const rec = { id: fid, blob, name: cleanFileName(r.name), mime: safeMime(r.mime || blob.type), size: blob.size, from: duid, fromName: devName(duid), ts: Date.now(), origin, rel: r.rel || '', batch: r.batch || null };
+  S.blobs.set(fid, blob);
+  try {
+    await idb.put('files', rec);
+    S.blobs.delete(fid); // lepaskan dari memori; dibaca lagi dari IndexedDB bila perlu
+  } catch (e) { console.warn('IDB penuh/gagal', e); }
   S.received.unshift({ ...rec, blob: undefined });
   refresh('files');
 }
@@ -447,7 +664,7 @@ function cancelItem(duid, it) {
   if (!l) return;
   if (it.kind === 'batch') {
     if (it.dir === 'out') { for (const t of [...l.queue, ...l.tx.values()]) if (t.batch === it.id) l.cancel(t); }
-    else { for (const r of l.rx.values()) if (r.batch === it.id) l.cancel(r); l.send({ t: 'batch-cancel', batch: it.id }); }
+    else { for (const r of l.rx.values()) if (r.batch === it.rbatch) l.cancel(r); if (it.rbatch) l.send({ t: 'batch-cancel', batch: it.rbatch }); }
     it.state = 'cancelled'; updateItem(duid, it); saveTL(duid);
   } else if (live && live.t) l.cancel(live.t);
   else { for (const t of l.queue) if (t.id === it.id) l.cancel(t); }
@@ -459,10 +676,10 @@ function cancelItem(duid, it) {
 async function openSink(r) {
   try {
     let dir = S.dirHandle;
-    const parts = (r.rel || '').split('/').filter(Boolean);
+    const parts = (r.rel || '').split('/').filter((p) => p && !/^\.+$/.test(p));
     parts.pop();
-    for (const p of parts) dir = await dir.getDirectoryHandle(p.replace(/[\\:*?"<>|]/g, '_'), { create: true });
-    let name = (r.name || 'berkas').replace(/[\\/:*?"<>|]/g, '_');
+    for (const p of parts) dir = await dir.getDirectoryHandle(cleanFileName(p), { create: true });
+    let name = cleanFileName(r.name);
     const dot = name.lastIndexOf('.');
     const base = dot > 0 ? name.slice(0, dot) : name, ext = dot > 0 ? name.slice(dot) : '';
     for (let i = 1; i < 500; i++) {
@@ -528,7 +745,8 @@ function sendClipImage(blob, targets) {
   toast(`Gambar dikirim ke ${links.length > 1 ? links.length + ' perangkat' : esc(devName(links[0].duid))}`, { icon: 'image', kind: 'ok' });
 }
 function recvClip(duid, m) {
-  S.clips.unshift({ id: m.id || uid(), dir: 'in', kind: 'text', text: m.text, from: duid, ts: Date.now() });
+  if (typeof m.text !== 'string' || !m.text || m.text.length > 1000000) return;
+  S.clips.unshift({ id: uid(), dir: 'in', kind: 'text', text: m.text, from: duid, ts: Date.now() });
   S.clips = S.clips.slice(0, 80);
   save.clips();
   S.lastClip = m.text;
@@ -549,15 +767,16 @@ function clipToast(duid, text) {
   });
 }
 async function recvClipImage(duid, r) {
+  const img = r.blob;
   await storeReceived(r, duid, 'clip');
-  S.clips.unshift({ id: r.id, dir: 'in', kind: 'image', fid: r.id, from: duid, ts: Date.now() });
+  S.clips.unshift({ id: uid(), dir: 'in', kind: 'image', fid: r.fid, from: duid, ts: Date.now() });
   save.clips(); refresh('clips');
   if (S.page !== 'clipboard') bump('clipboard');
   let ok = false;
-  if (S.settings.clipAutoCopy && document.hasFocus()) ok = await copyImage(r.blob, true);
+  if (S.settings.clipAutoCopy && document.hasFocus()) ok = await copyImage(img, true);
   toast(`<b>Gambar papan klip dari ${esc(devName(duid))}</b>${ok ? '<br>Sudah disalin.' : ''}`, {
     icon: 'image', timeout: 8000,
-    actions: [{ label: 'Salin', fn: () => copyImage(r.blob) }, { label: 'Lihat', fn: () => preview(r.id) }],
+    actions: [{ label: 'Salin', fn: () => copyImage(img) }, { label: 'Lihat', fn: () => preview(r.fid) }],
   });
 }
 async function copyText(text, quiet = false) {
@@ -646,10 +865,12 @@ function noteTitle(n) {
   const first = (n.body || '').split('\n').find((x) => x.trim()) || '';
   return first.trim().slice(0, 80) || 'Catatan baru';
 }
-function mergeNote(n, from) {
-  if (!n || !n.id) return;
-  const cur = S.notes[n.id];
-  if (cur && cur.updatedAt >= n.updatedAt) return;
+function mergeNote(raw, from) {
+  const n = vNote(raw);
+  if (!n) return;
+  const cur = hasOwn(S.notes, n.id) ? S.notes[n.id] : null;
+  if (!cur && n.deleted && Object.keys(S.notes).length > 5000) return;
+  if (cur && (cur.updatedAt > n.updatedAt || (cur.updatedAt === n.updatedAt && (cur.by || '') >= (n.by || '')))) return;
   // Pengguna sedang mengetik catatan yang sama: tunda, jangan dibuang
   if (cur && S.page === 'notes' && S.noteSel === n.id && document.activeElement && document.activeElement.id === 'noteBody' && Date.now() - (S.lastNoteType || 0) < 1800) {
     S.noteDefer = S.noteDefer || {};
@@ -657,7 +878,8 @@ function mergeNote(n, from) {
     S.noteDefer[n.id] = setTimeout(() => { mergeNote(n, from); refresh('notes'); }, 1900);
     return;
   }
-  S.notes[n.id] = { id: n.id, body: n.body || '', updatedAt: n.updatedAt, deleted: !!n.deleted, pinned: !!n.pinned, by: n.by };
+  if (!cur && Object.keys(S.notes).length >= 5000) return;
+  S.notes[n.id] = n;
   save.notes();
   net.broadcast({ t: 'note', note: S.notes[n.id] }, from);
   if (S.page === 'notes' && S.noteSel === n.id) {
@@ -671,11 +893,12 @@ function mergeNote(n, from) {
   }
   if (S.page !== 'notes') bump('notes');
 }
-const pushNote = debounce((id) => { const n = S.notes[id]; if (n) net.broadcast({ t: 'note', note: n }); }, 350);
+const pushNote = debounce((id) => { const n = hasOwn(S.notes, id) && S.notes[id]; if (n) net.broadcast({ t: 'note', note: n }); }, 350);
 function editNote(id, patch) {
-  const n = S.notes[id];
+  const n = hasOwn(S.notes, id) && S.notes[id];
   if (!n) return;
-  Object.assign(n, patch, { updatedAt: Date.now(), by: me.name });
+  // selalu lebih baru dari versi sebelumnya, walau jam perangkat berbeda
+  Object.assign(n, patch, { updatedAt: Math.max(Date.now(), n.updatedAt + 1), by: me.name });
   save.notes();
   pushNote(id);
 }
@@ -690,6 +913,15 @@ function newNote(body = '') {
 // =====================================================================
 // AKSES BERKAS (berkas bersama)
 // =====================================================================
+function vSharedList(items) {
+  if (!Array.isArray(items)) return [];
+  const out = [];
+  for (const x of items.slice(0, 1000)) {
+    if (!isObj(x) || !okId(x.id)) continue;
+    out.push({ id: x.id, name: cleanFileName(x.name), size: safeInt(x.size, 0, LIMITS.fileMax) || 0, mime: safeMime(x.mime), ts: safeInt(x.ts, 0, 9e15) || 0, thumb: okThumb(x.thumb) ? x.thumb : null, rel: '' });
+  }
+  return out;
+}
 function sharedMeta() {
   return S.myShared.map((x) => ({ id: x.id, name: x.name, size: x.size, mime: x.mime, ts: x.ts, thumb: x.thumb || null, rel: x.rel || '' }));
 }
@@ -728,6 +960,7 @@ function requestShared(duid, item) {
 }
 
 async function getBlob(fid) {
+  if (!okId(fid)) return null;
   if (S.blobs.has(fid)) return S.blobs.get(fid);
   try {
     const rec = await idb.get('files', fid);
@@ -736,10 +969,11 @@ async function getBlob(fid) {
   return null;
 }
 async function blobUrl(fid) {
+  if (!okId(fid)) return null;
   if (S.urls.has(fid)) return S.urls.get(fid);
   const b = await getBlob(fid);
   if (!b) return null;
-  const u = URL.createObjectURL(b);
+  const u = URL.createObjectURL(safeBlob(b)); // tipe aman: tak pernah dijalankan sebagai HTML/SVG
   S.urls.set(fid, u);
   return u;
 }
@@ -800,7 +1034,9 @@ async function shareScreen(duids) {
   if (!links.length) { toast('Pilih perangkat tujuan.', { icon: 'info' }); return; }
   let stream;
   try {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30, max: 60 }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: true });
+    const video = { frameRate: { ideal: 30, max: 60 }, width: { ideal: 1920 }, height: { ideal: 1080 } };
+    try { stream = await navigator.mediaDevices.getDisplayMedia({ video, audio: true }); }
+    catch (e) { if (e && e.name === 'TypeError') stream = await navigator.mediaDevices.getDisplayMedia({ video }); else throw e; } // Safari: tanpa audio
   } catch (e) { if (e && e.name !== 'NotAllowedError') toast('Tidak bisa memulai berbagi layar.', { icon: 'x' }); return; }
   const v = stream.getVideoTracks()[0];
   for (const l of links) {
@@ -845,30 +1081,59 @@ async function flipCamera(sid) {
 function requestScreen(duid) {
   const l = linkOf(duid);
   if (!l) return;
+  S.expect.set(duid + '|screen', Date.now() + 90000);
   l.send({ t: 'scr-req' });
   toast(`Meminta layar ${esc(devName(duid))}… Konfirmasi di perangkat tersebut.`, { icon: 'mirror' });
 }
 function requestCamera(duid, facing = 'environment') {
   const l = linkOf(duid);
   if (!l) return;
-  l.send({ t: 'cam-req', facing });
+  S.expect.set(duid + '|camera', Date.now() + 90000);
+  l.send({ t: 'cam-req', facing: facing === 'user' ? 'user' : 'environment' });
   toast(`Meminta kamera ${esc(devName(duid))}… Ketuk Izinkan di perangkat tersebut.`, { icon: 'camera' });
 }
-function askMedia(duid, kind, facing) {
+function askMedia(l, kind, facing) {
+  const duid = l.duid;
   const name = esc(devName(duid));
-  if (kind === 'screen' && !canShareScreen()) { linkOf(duid) && linkOf(duid).send({ t: 'media-deny', kind }); return; }
+  const key = duid + '|' + kind;
+  if (kind === 'screen' && !canShareScreen()) { l.send({ t: 'media-deny', kind }); return; }
+  if (modals.has('ask-' + key)) return;                       // sudah ditampilkan
+  if ((S.askCool.get(key) || 0) > Date.now()) { l.send({ t: 'media-deny', kind }); return; } // baru saja ditolak
   if (S.settings.sound) chime();
+  let done = false;
+  const deny = () => { done = true; S.askCool.set(key, Date.now() + 15000); l.send({ t: 'media-deny', kind }); };
   notify('Taut', kind === 'screen' ? `${devName(duid)} ingin melihat layar Anda` : `${devName(duid)} ingin memakai kamera Anda`);
   modal({
-    id: 'ask-' + kind, icon: kind === 'screen' ? 'mirror' : 'camera',
+    id: 'ask-' + key, icon: kind === 'screen' ? 'mirror' : 'camera', link: l, dismiss: false,
+    onClose: () => { if (!done) deny(); },
     title: kind === 'screen' ? `${name} ingin melihat layar Anda` : `${name} ingin memakai kamera Anda`,
     body: kind === 'screen'
       ? '<p>Pilih layar, jendela, atau tab yang ingin dibagikan. Anda bisa menghentikannya kapan saja.</p>'
       : `<p>Kamera ${facing === 'user' ? 'depan' : 'belakang'} perangkat ini akan tampil di ${name}. Anda bisa menghentikannya kapan saja.</p>`,
     actions: [
-      { label: 'Tolak', fn: () => { const l = linkOf(duid); l && l.send({ t: 'media-deny', kind }); } },
-      { label: kind === 'screen' ? 'Bagikan layar' : 'Izinkan kamera', primary: true, fn: () => (kind === 'screen' ? shareScreen([duid]) : shareCamera(duid, facing || 'environment')) },
+      { label: 'Tolak', fn: deny },
+      { label: kind === 'screen' ? 'Bagikan layar' : 'Izinkan kamera', primary: true, fn: () => { done = true; return kind === 'screen' ? shareScreen([duid]) : shareCamera(duid, facing === 'user' ? 'user' : 'environment'); } },
     ],
+  });
+}
+// Media masuk hanya tampil bila kita yang meminta, atau pengguna mengizinkannya
+function mediaGate(l, ms) {
+  if (!l.active || !l.duid) return false;
+  const key = l.duid + '|' + ms.kind;
+  if ((S.expect.get(key) || 0) > Date.now()) { S.expect.delete(key); return true; }
+  return new Promise((res) => {
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; res(v); } };
+    const nm = esc(devName(l.duid));
+    if (S.settings.sound) chime();
+    modal({
+      id: 'mg-' + ms.sid, link: l, dismiss: false, icon: ms.kind === 'screen' ? 'mirror' : 'camera',
+      title: ms.kind === 'screen' ? `${nm} ingin menampilkan layarnya di sini` : `${nm} ingin menampilkan kameranya di sini`,
+      body: '<p>Tampilan akan terbuka di jendela kecil yang bisa Anda tutup kapan saja.</p>',
+      actions: [{ label: 'Tolak', fn: () => fin(false) }, { label: 'Tampilkan', primary: true, fn: () => fin(true) }],
+      onClose: () => fin(false),
+    });
+    setTimeout(() => { if (!done) closeModal('mg-' + ms.sid); }, 30000);
   });
 }
 function onMedia(l, ms) {
@@ -887,6 +1152,7 @@ function onMedia(l, ms) {
   refresh('sessions');
 }
 function onMediaEnd(l, ms, remote) {
+  closeModal('mg-' + ms.sid);
   const s = S.sessions.get(ms.sid);
   if (!s) return;
   S.sessions.delete(ms.sid);
@@ -924,7 +1190,7 @@ function openWin(s) {
         ${s.dir === 'in' ? `<button class="wbtn" data-w="sound" title="Suara">${icon('audio', 17)}</button>` : ''}
         ${document.pictureInPictureEnabled || (HTMLVideoElement.prototype.webkitSetPresentationMode) ? `<button class="wbtn" data-w="pip" title="Gambar dalam gambar">${icon('pip', 17)}</button>` : ''}
         <button class="wbtn" data-w="full" title="Layar penuh">${icon('full', 17)}</button>
-        <button class="wbtn danger" data-w="close" title="${s.dir === 'out' ? 'Hentikan' : 'Tutup'}">${icon('x', 17)}</button>
+        <button class="wbtn danger" data-w="close" title="${esc(s.dir === 'out' ? 'Hentikan' : 'Tutup')}">${icon('x', 17)}</button>
       </div>
     </div>
     <div class="win-body"><video autoplay playsinline muted></video><div class="win-wait">${icon('refresh', 22, 'spin')}<span>Menyambungkan video…</span></div></div>`;
@@ -996,7 +1262,7 @@ async function snapshot(s, v) {
   g.drawImage(v, 0, 0);
   const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
   const d = new Date();
-  const name = `${s.kind === 'screen' ? 'Tangkapan layar' : 'Foto'} ${devName(s.duid)} ${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}-${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}${String(d.getSeconds()).padStart(2, '0')}.png`;
+  const name = cleanFileName(`${s.kind === 'screen' ? 'Tangkapan layar' : 'Foto'} ${devName(s.duid)} ${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}-${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}${String(d.getSeconds()).padStart(2, '0')}.png`);
   const r = { id: uid(), blob, name, mime: 'image/png', size: blob.size };
   await storeReceived(r, s.duid);
   s.win && s.win.classList.add('flash');
@@ -1007,7 +1273,7 @@ async function snapshot(s, v) {
 // =====================================================================
 // CARI PERANGKAT (bunyikan)
 // =====================================================================
-let ringTimer = null;
+let ringTimer = null, ringFrom = null;
 function ringDevice(duid) {
   const l = linkOf(duid);
   if (!l) return;
@@ -1015,7 +1281,8 @@ function ringDevice(duid) {
   toast(`Membunyikan ${esc(devName(duid))}…`, { icon: 'ring', actions: [{ label: 'Hentikan', fn: () => l.send({ t: 'ring-stop' }) }] });
 }
 function startRing(duid) {
-  stopRing(true);
+  stopRing();
+  ringFrom = duid;
   const el = document.createElement('div');
   el.className = 'ring-ov';
   el.innerHTML = `<div class="ring-pulse">${icon('ring', 46)}</div><h2>${esc(devName(duid))} sedang mencari perangkat ini</h2><button class="btn primary lg" data-act="ring-stop">Saya di sini</button>`;
@@ -1026,7 +1293,7 @@ function startRing(duid) {
   ringTimer = setInterval(beat, 1200);
 }
 function stopRing() {
-  clearInterval(ringTimer); ringTimer = null;
+  clearInterval(ringTimer); ringTimer = null; ringFrom = null;
   $$('.ring-ov').forEach((x) => x.remove());
 }
 
@@ -1055,7 +1322,7 @@ function toast(html, { icon: ic = 'info', actions = [], timeout = 4200, kind = '
   const box = $('#toasts');
   const el = document.createElement('div');
   el.className = 'toast ' + kind;
-  el.innerHTML = `<span class="t-ic">${icon(ic, 18)}</span><div class="t-body">${html}</div>${actions.map((a, i) => `<button class="t-act" data-i="${i}">${esc(a.label)}</button>`).join('')}<button class="t-x" aria-label="Tutup">${icon('x', 14)}</button>`;
+  el.innerHTML = `<span class="t-ic">${icon(ic, 18)}</span><div class="t-body">${html}</div>${actions.map((a, i) => `<button class="t-act" data-i="${esc(i)}">${esc(a.label)}</button>`).join('')}<button class="t-x" aria-label="Tutup">${icon('x', 14)}</button>`;
   el.addEventListener('click', (e) => {
     const b = e.target.closest('button');
     if (!b) return;
@@ -1068,14 +1335,14 @@ function toast(html, { icon: ic = 'info', actions = [], timeout = 4200, kind = '
 }
 
 const modals = new Map();
-function modal({ id = uid(), title = '', icon: ic = '', body = '', actions = [], cls = '', onClose, wide = false, dismiss = true }) {
+function modal({ id = uid(), title = '', icon: ic = '', body = '', actions = [], cls = '', onClose, wide = false, dismiss = true, link = null }) {
   closeModal(id);
   const el = document.createElement('div');
   el.className = 'modal-wrap';
   el.innerHTML = `<div class="modal ${cls} ${wide ? 'wide' : ''}" role="dialog" aria-modal="true">
     ${title ? `<div class="modal-head">${ic ? `<span class="m-ic">${icon(ic, 22)}</span>` : ''}<h2>${title}</h2>${dismiss ? `<button class="icon-btn m-x" aria-label="Tutup">${icon('x', 18)}</button>` : ''}</div>` : ''}
     <div class="modal-body">${body}</div>
-    ${actions.length ? `<div class="modal-foot">${actions.map((a, i) => `<button class="btn ${a.primary ? 'primary' : ''} ${a.danger ? 'danger' : ''}" data-mi="${i}">${esc(a.label)}</button>`).join('')}</div>` : ''}
+    ${actions.length ? `<div class="modal-foot">${actions.map((a, i) => `<button class="btn ${a.primary ? 'primary' : ''} ${a.danger ? 'danger' : ''}" data-mi="${esc(i)}">${esc(a.label)}</button>`).join('')}</div>` : ''}
   </div>`;
   const close = () => { if (!modals.has(id)) return; modals.delete(id); el.classList.add('out'); setTimeout(() => el.remove(), 180); onClose && onClose(); };
   el.addEventListener('click', (e) => {
@@ -1084,7 +1351,7 @@ function modal({ id = uid(), title = '', icon: ic = '', body = '', actions = [],
     if (b) { const a = actions[+b.dataset.mi]; const r = a.fn && a.fn(); if (r !== false) close(); }
   });
   $('#overlays').appendChild(el);
-  modals.set(id, { el, close });
+  modals.set(id, { el, close, dismiss, link });
   return { el, close };
 }
 function closeModal(id) { const m = modals.get(id); if (m) m.close(); }
@@ -1167,11 +1434,11 @@ function shell() {
   $('#sidebar').innerHTML = `
     <div class="brand">${logo(34)}<div class="brand-t"><b>Taut</b><span>Kit Kerja Lintas Perangkat</span></div></div>
     <button class="me-card" data-act="connect" id="meCard"></button>
-    <nav class="nav">${NAV.map((n) => `<button class="nav-item" data-page="${n.id}" title="${n.label}">${icon(n.ic, 20)}<span>${n.label}</span><i class="badge" data-badge="${n.id}"></i></button>`).join('')}</nav>
+    <nav class="nav">${NAV.map((n) => `<button class="nav-item" data-page="${esc(n.id)}" title="${esc(n.label)}">${icon(n.ic, 20)}<span>${n.label}</span><i class="badge" data-badge="${esc(n.id)}"></i></button>`).join('')}</nav>
     <div class="side-sec"><span>Perangkat terhubung</span><button class="mini-btn" data-act="connect" title="Hubungkan perangkat">${icon('plus', 16)}</button></div>
     <div id="sideDevices" class="side-devices"></div>
     <div class="side-foot"><button class="nav-item" data-page="settings">${icon('settings', 20)}<span>Pengaturan</span></button></div>`;
-  $('#tabbar').innerHTML = TABS.map((id) => { const n = NAV.find((x) => x.id === id); return `<button class="tab" data-page="${id}">${icon(n.ic, 22)}<span>${n.short || n.label}</span><i class="badge" data-badge="${id}"></i></button>`; }).join('') +
+  $('#tabbar').innerHTML = TABS.map((id) => { const n = NAV.find((x) => x.id === id); return `<button class="tab" data-page="${esc(id)}">${icon(n.ic, 22)}<span>${n.short || n.label}</span><i class="badge" data-badge="${esc(id)}"></i></button>`; }).join('') +
     `<button class="tab" data-act="more">${icon('grid', 22)}<span>Lainnya</span><i class="badge" data-badge="more"></i></button>`;
 }
 
@@ -1222,7 +1489,7 @@ function renderNetPill() {
   el.innerHTML = `<span class="dot"></span><span>${s === 'online' ? (n ? `${n} perangkat terhubung` : 'Daring') : s === 'connecting' ? 'Menyambung…' : 'Luring'}</span>`;
 }
 function batteryHtml(b) {
-  if (!b || b.level == null) return '';
+  if (!b || !Number.isInteger(b.level)) return '';
   const lv = Math.max(0, Math.min(100, b.level));
   return `<span class="batt ${lv <= 20 ? 'low' : ''} ${b.charging ? 'chg' : ''}" title="Baterai ${lv}%"><span class="batt-b"><i style="width:${lv}%"></i></span>${lv}%${b.charging ? icon('bolt', 11) : ''}</span>`;
 }
@@ -1241,9 +1508,9 @@ function renderSideDevices() {
   if (!el) return;
   const list = connected();
   const conn = [...net.links.values()].filter((l) => l.state === 'connecting' && !l.quiet);
-  el.innerHTML = list.map((d) => `<button class="side-dev ${S.sel === d.uid && S.page === 'transfer' ? 'active' : ''}" data-act="open-dev" data-uid="${d.uid}">
+  el.innerHTML = list.map((d) => `<button class="side-dev ${S.sel === d.uid && S.page === 'transfer' ? 'active' : ''}" data-act="open-dev" data-uid="${esc(d.uid)}">
       <span class="sd-ic">${icon(deviceIcon(d.type), 18)}<i class="dot ok"></i></span>
-      <span class="sd-t"><b>${esc(d.name)}</b><small>${d.via ? (d.via === 'lan' ? 'Jaringan lokal' : 'Internet') : 'Terhubung'}${d.battery && d.battery.level != null ? ' · ' + d.battery.level + '%' : ''}</small></span></button>`).join('') +
+      <span class="sd-t"><b>${esc(d.name)}</b><small>${d.via ? (d.via === 'lan' ? 'Jaringan lokal' : 'Internet') : 'Terhubung'}${d.battery && Number.isInteger(d.battery.level) ? ' · ' + d.battery.level + '%' : ''}</small></span></button>`).join('') +
     conn.map((l) => `<div class="side-dev wait"><span class="sd-ic">${icon('refresh', 18, 'spin')}</span><span class="sd-t"><b>${fmtCode(l.rid)}</b><small>Menunggu persetujuan…</small></span></div>`).join('') +
     (!list.length && !conn.length ? `<button class="side-empty" data-act="connect">${icon('qr', 18)}<span>Belum ada perangkat.<br><b>Hubungkan sekarang</b></span></button>` : '');
 }
@@ -1287,7 +1554,7 @@ PAGES.home = {
     <div class="sec-h"><h3>Perangkat terhubung</h3><span id="homeCount" class="muted"></span></div>
     <div id="homeDevices"></div>
     <div class="sec-h"><h3>Fitur</h3></div>
-    <div class="feat-grid">${FEATURES.map((f) => `<button class="feat ${f.c}" ${f.page ? `data-page="${f.page}"` : `data-act="${f.act}"`}><span class="feat-ic">${icon(f.ic, 22)}</span><b>${f.t}</b><small>${f.d}</small></button>`).join('')}</div>
+    <div class="feat-grid">${FEATURES.map((f) => `<button class="feat ${f.c}" ${f.page ? `data-page="${esc(f.page)}"` : `data-act="${esc(f.act)}"`}><span class="feat-ic">${icon(f.ic, 22)}</span><b>${f.t}</b><small>${f.d}</small></button>`).join('')}</div>
     <div class="sec-h"><h3>Aktivitas terbaru</h3></div>
     <div id="homeActivity" class="card list-card"></div>`,
   mount() { this.update(new Set(['devices', 'activity'])); },
@@ -1323,14 +1590,14 @@ function devCard(d) {
         <span class="chip ok"><i class="dot ok"></i>Terhubung</span>
         <div class="dev-sub">${viaHtml(d)}${batteryHtml(d.battery)}</div>
       </div>
-      <button class="icon-btn" data-act="dev-menu" data-uid="${d.uid}" title="Lainnya">${icon('more', 18)}</button>
+      <button class="icon-btn" data-act="dev-menu" data-uid="${esc(d.uid)}" title="Lainnya">${icon('more', 18)}</button>
     </div>
     <div class="dev-acts">
-      <button data-act="send-files" data-uid="${d.uid}">${icon('transfer', 18)}<span>Kirim berkas</span></button>
-      <button data-act="send-clip" data-uid="${d.uid}">${icon('clipboard', 18)}<span>Papan klip</span></button>
-      ${d.features && d.features.screen ? `<button data-act="req-screen" data-uid="${d.uid}">${icon('mirror', 18)}<span>Lihat layar</span></button>` : (canShareScreen() ? `<button data-act="share-screen" data-uid="${d.uid}">${icon('mirror', 18)}<span>Bagikan layar</span></button>` : '')}
-      ${d.features && d.features.camera ? `<button data-act="req-cam" data-uid="${d.uid}">${icon('camera', 18)}<span>Pakai kamera</span></button>` : ''}
-      <button data-act="ring" data-uid="${d.uid}">${icon('ring', 18)}<span>Bunyikan</span></button>
+      <button data-act="send-files" data-uid="${esc(d.uid)}">${icon('transfer', 18)}<span>Kirim berkas</span></button>
+      <button data-act="send-clip" data-uid="${esc(d.uid)}">${icon('clipboard', 18)}<span>Papan klip</span></button>
+      ${d.features && d.features.screen ? `<button data-act="req-screen" data-uid="${esc(d.uid)}">${icon('mirror', 18)}<span>Lihat layar</span></button>` : (canShareScreen() ? `<button data-act="share-screen" data-uid="${esc(d.uid)}">${icon('mirror', 18)}<span>Bagikan layar</span></button>` : '')}
+      ${d.features && d.features.camera ? `<button data-act="req-cam" data-uid="${esc(d.uid)}">${icon('camera', 18)}<span>Pakai kamera</span></button>` : ''}
+      <button data-act="ring" data-uid="${esc(d.uid)}">${icon('ring', 18)}<span>Bunyikan</span></button>
     </div>
   </div>`;
 }
@@ -1409,7 +1676,7 @@ function renderConvList() {
   el.innerHTML = `<div class="cl-head"><b>Perangkat</b><button class="mini-btn" data-act="connect" title="Hubungkan">${icon('plus', 16)}</button></div>` + (list.length ? list.map((d) => {
     const last = tl(d.uid).slice(-1)[0];
     const lastTxt = last ? (last.kind === 'text' ? last.text : last.kind === 'batch' ? '📁 ' + last.name : '📎 ' + last.name) : (d.ready ? 'Terhubung' : 'Tidak terhubung');
-    return `<button class="cl-item ${S.sel === d.uid ? 'active' : ''} ${d.ready ? '' : 'off'}" data-act="sel-dev" data-uid="${d.uid}">
+    return `<button class="cl-item ${S.sel === d.uid ? 'active' : ''} ${d.ready ? '' : 'off'}" data-act="sel-dev" data-uid="${esc(d.uid)}">
       <span class="cl-ic">${icon(deviceIcon(d.type), 20)}<i class="dot ${d.ready ? 'ok' : 'off'}"></i></span>
       <span class="cl-t"><b>${esc(d.name)}</b><small>${esc(String(lastTxt).slice(0, 48))}</small></span>
       ${last ? `<small class="cl-time">${fmtTime(last.ts).replace(/^.*, /, '')}</small>` : ''}</button>`;
@@ -1429,7 +1696,7 @@ function renderConvHead() {
     <div class="ch-acts">
       ${on ? `<button class="btn sm" data-act="tf-files">${icon('clip', 16)}<span class="hide-sm">Berkas</span></button>
       ${!isIOS() ? `<button class="btn sm hide-sm" data-act="tf-folder">${icon('folderUp', 16)}<span>Folder</span></button>` : ''}
-      <button class="btn sm" data-act="tf-clear" title="Bersihkan riwayat">${icon('trash', 16)}</button>` : `<button class="btn sm primary" data-act="reconnect" data-uid="${S.sel}">${icon('refresh', 16)}Hubungkan ulang</button>`}
+      <button class="btn sm" data-act="tf-clear" title="Bersihkan riwayat">${icon('trash', 16)}</button>` : `<button class="btn sm primary" data-act="reconnect" data-uid="${esc(S.sel)}">${icon('refresh', 16)}Hubungkan ulang</button>`}
     </div>`;
 }
 function renderTimeline() {
@@ -1456,7 +1723,7 @@ function appendTimeline(item) {
 }
 function updateItem(duid, it) {
   if (S.page !== 'transfer' || S.sel !== duid) return;
-  const node = $(`#timeline [data-id="${it.id}"]`);
+  const node = $(`#timeline [data-id="${CSS.escape(it.id)}"]`);
   if (!node) return;
   node.outerHTML = itemHtml(it);
   hydrateThumbs($('#timeline'));
@@ -1467,7 +1734,7 @@ function patchProgress(duid, it, frac, speed) {
   const now = performance.now();
   if (now - (progEmit.get(it.id) || 0) < 100 && frac < 1) return;
   progEmit.set(it.id, now);
-  const node = $(`#timeline [data-id="${it.id}"]`);
+  const node = $(`#timeline [data-id="${CSS.escape(it.id)}"]`);
   if (!node) return;
   const bar = $('.prog i', node), lab = $('.pstat', node);
   const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
@@ -1479,33 +1746,33 @@ function itemHtml(it) {
   const time = `<span class="m-time">${fmtTime(it.ts)}${it.dir === 'out' && it.state === 'done' ? ' · ' + icon('check', 12) : ''}</span>`;
   if (it.kind === 'text') {
     const url = firstUrl(it.text);
-    return `<div class="msg ${it.dir}" data-id="${it.id}"><div class="bubble text">${linkify(it.text)}
-      <div class="b-acts"><button data-act="copy-text" data-id="${it.id}">${icon('copy', 14)}Salin</button>${url && it.dir === 'in' ? `<a href="${esc(url)}" target="_blank" rel="noopener">${icon('link', 14)}Buka</a>` : ''}</div></div>${time}</div>`;
+    return `<div class="msg ${it.dir}" data-id="${esc(it.id)}"><div class="bubble text">${linkify(it.text)}
+      <div class="b-acts"><button data-act="copy-text" data-id="${esc(it.id)}">${icon('copy', 14)}Salin</button>${url && it.dir === 'in' ? `<a href="${esc(url)}" target="_blank" rel="noopener">${icon('link', 14)}Buka</a>` : ''}</div></div>${time}</div>`;
   }
   const active = ['queued', 'sending', 'receiving'].includes(it.state);
   const st = STATE_TXT[it.state] || '';
   if (it.kind === 'batch') {
     const pct = Math.round((it.doneBytes / Math.max(1, it.size)) * 100);
-    return `<div class="msg ${it.dir}" data-id="${it.id}"><div class="bubble file">
+    return `<div class="msg ${it.dir}" data-id="${esc(it.id)}"><div class="bubble file">
       <div class="file-card"><span class="f-ic folder">${icon('folder', 24)}</span>
         <div class="f-info"><b>${esc(it.name)}</b><small>${it.count} berkas · ${fmtSize(it.size)}${st ? ' · ' + st : ''}${it.state === 'done' && it.files && it.files.some((f) => f.disk) ? ' · tersimpan di folder' : ''}</small>
         ${active ? `<div class="prog"><i style="width:${pct}%"></i></div><small class="pstat">${pct}% · ${it.doneCount}/${it.count}</small>` : ''}</div></div>
-      <div class="f-acts">${active ? `<button data-act="tf-cancel" data-id="${it.id}">${icon('x', 14)}Batal</button>` : ''}
-      ${it.dir === 'in' && it.state === 'done' ? `<button data-act="save-batch" data-id="${it.id}">${icon('download', 14)}Simpan ZIP</button>` : ''}</div>
+      <div class="f-acts">${active ? `<button data-act="tf-cancel" data-id="${esc(it.id)}">${icon('x', 14)}Batal</button>` : ''}
+      ${it.dir === 'in' && it.state === 'done' ? `<button data-act="save-batch" data-id="${esc(it.id)}">${icon('download', 14)}Simpan ZIP</button>` : ''}</div>
     </div>${time}</div>`;
   }
   const k = fileKind(it.mime, it.name);
   const pct = 0;
   const media = k === 'image' && (it.state === 'done' || it.dir === 'out') && !it.disk;
-  return `<div class="msg ${it.dir}" data-id="${it.id}"><div class="bubble file ${media ? 'has-media' : ''}">
-    ${media ? `<button class="media-prev" data-act="preview" data-fid="${it.fid}"><img data-fid="${it.fid}" alt=""></button>` : ''}
+  return `<div class="msg ${it.dir}" data-id="${esc(it.id)}"><div class="bubble file ${media ? 'has-media' : ''}">
+    ${media ? `<button class="media-prev" data-act="preview" data-fid="${esc(it.fid)}"><img data-fid="${esc(it.fid)}" alt=""></button>` : ''}
     <div class="file-card"><span class="f-ic ${k}">${icon(kindIcon(k), 22)}<em>${esc(extOf(it.name))}</em></span>
       <div class="f-info"><b title="${esc(it.name)}">${esc(it.name)}</b><small>${fmtSize(it.size)}${st ? ' · ' + st : ''}${it.disk ? ' · tersimpan di folder' : ''}${it.fromShare ? ' · dari Akses Berkas' : ''}</small>
       ${active ? `<div class="prog"><i style="width:${pct}%"></i></div><small class="pstat">${it.state === 'queued' ? 'Mengantre…' : '0%'}</small>` : ''}</div></div>
-    <div class="f-acts">${active ? `<button data-act="tf-cancel" data-id="${it.id}">${icon('x', 14)}Batal</button>` : ''}
-      ${it.state === 'done' && !it.disk ? `${!media && ['image', 'video', 'audio', 'doc'].includes(k) ? `<button data-act="preview" data-fid="${it.fid}">${icon('eye', 14)}Buka</button>` : ''}
-        ${it.dir === 'in' ? `<button data-act="save-file" data-fid="${it.fid}">${icon('download', 14)}Simpan</button>` : ''}
-        ${isIOS() ? `<button data-act="share-file" data-fid="${it.fid}">${icon('share', 14)}Bagikan</button>` : ''}` : ''}
+    <div class="f-acts">${active ? `<button data-act="tf-cancel" data-id="${esc(it.id)}">${icon('x', 14)}Batal</button>` : ''}
+      ${it.state === 'done' && !it.disk ? `${!media && ['image', 'video', 'audio', 'doc'].includes(k) ? `<button data-act="preview" data-fid="${esc(it.fid)}">${icon('eye', 14)}Buka</button>` : ''}
+        ${it.dir === 'in' ? `<button data-act="save-file" data-fid="${esc(it.fid)}">${icon('download', 14)}Simpan</button>` : ''}
+        ${isIOS() ? `<button data-act="share-file" data-fid="${esc(it.fid)}">${icon('share', 14)}Bagikan</button>` : ''}` : ''}
     </div></div>${time}</div>`;
 }
 function hydrateThumbs(root) {
@@ -1540,28 +1807,28 @@ PAGES.clipboard = {
   update(p) {
     if (p.has('devices')) {
       const sel = $('#clipTarget');
-      if (sel) { const v = sel.value; const list = connected(); sel.innerHTML = `<option value="">Semua perangkat (${list.length})</option>` + list.map((d) => `<option value="${d.uid}">${esc(d.name)}</option>`).join(''); sel.value = list.some((d) => d.uid === v) ? v : ''; }
+      if (sel) { const v = sel.value; const list = connected(); sel.innerHTML = `<option value="">Semua perangkat (${list.length})</option>` + list.map((d) => `<option value="${esc(d.uid)}">${esc(d.name)}</option>`).join(''); sel.value = list.some((d) => d.uid === v) ? v : ''; }
     }
     if (p.has('clips') || p.has('devices') || p.has('settings')) {
       const autoOk = !isIOS() && /Chrome|Chromium|Edg\//.test(navigator.userAgent) && !!(navigator.clipboard && navigator.clipboard.readText);
       $('#clipSet').innerHTML = `<h3>Pengaturan</h3>
         ${switchRow('clipAutoCopy', 'Salin otomatis saat menerima', 'Isi papan klip dari perangkat lain langsung disalin ke perangkat ini (iPad/Safari: ketuk Salin pada pemberitahuan).')}
-        ${switchRow('clipAuto', 'Sinkron otomatis', autoOk ? 'Saat Anda menyalin sesuatu lalu kembali ke Taut, isinya dikirim otomatis ke semua perangkat.' : 'Tersedia di Chrome/Edge untuk Windows & Mac.', !autoOk)}
+        ${switchRow('clipAuto', 'Sinkron otomatis', autoOk ? 'Saat Anda menyalin sesuatu lalu kembali ke Taut, isinya dikirim otomatis ke semua perangkat. Hati-hati: kata sandi yang Anda salin juga ikut terkirim.' : 'Tersedia di Chrome/Edge untuk Windows & Mac.', !autoOk)}
         <div class="mini-stats"><div><b>${S.clips.filter((c) => c.dir === 'out').length}</b><small>Terkirim</small></div><div><b>${S.clips.filter((c) => c.dir === 'in').length}</b><small>Diterima</small></div><div><b>${connected().length}</b><small>Perangkat</small></div></div>`;
       const el = $('#clipList');
       el.innerHTML = S.clips.length ? S.clips.map((c) => `<div class="clip-item ${c.dir}">
           <div class="ci-head"><span class="ci-dir">${icon(c.dir === 'in' ? 'download' : 'send', 14)}${c.dir === 'in' ? 'Dari ' + esc(devName(c.from)) : 'Ke ' + esc((c.to || []).map(devName).join(', ') || 'perangkat')}</span><small>${fmtTime(c.ts)}</small></div>
-          ${c.kind === 'image' ? `<button class="ci-img" data-act="preview" data-fid="${c.fid}"><img data-fid="${c.fid}" alt=""></button>` : `<div class="ci-text">${linkify(c.text)}</div>`}
+          ${c.kind === 'image' ? `<button class="ci-img" data-act="preview" data-fid="${esc(c.fid)}"><img data-fid="${esc(c.fid)}" alt=""></button>` : `<div class="ci-text">${linkify(c.text)}</div>`}
           <div class="ci-acts">
-            ${c.kind === 'image' ? `<button class="btn sm" data-act="clip-copy-img" data-fid="${c.fid}">${icon('copy', 14)}Salin</button><button class="btn sm" data-act="save-file" data-fid="${c.fid}">${icon('download', 14)}Simpan</button>` : `<button class="btn sm" data-act="clip-copy" data-id="${c.id}">${icon('copy', 14)}Salin</button><button class="btn sm" data-act="clip-resend" data-id="${c.id}">${icon('send', 14)}Kirim lagi</button>`}
-            <button class="btn sm ghost" data-act="clip-del" data-id="${c.id}">${icon('trash', 14)}</button>
+            ${c.kind === 'image' ? `<button class="btn sm" data-act="clip-copy-img" data-fid="${esc(c.fid)}">${icon('copy', 14)}Salin</button><button class="btn sm" data-act="save-file" data-fid="${esc(c.fid)}">${icon('download', 14)}Simpan</button>` : `<button class="btn sm" data-act="clip-copy" data-id="${esc(c.id)}">${icon('copy', 14)}Salin</button><button class="btn sm" data-act="clip-resend" data-id="${esc(c.id)}">${icon('send', 14)}Kirim lagi</button>`}
+            <button class="btn sm ghost" data-act="clip-del" data-id="${esc(c.id)}">${icon('trash', 14)}</button>
           </div></div>`).join('') : `<div class="card empty-sm">${icon('clipboard', 28)}<br>Belum ada riwayat. Salin teks di perangkat lain lalu kirim ke sini.</div>`;
       hydrateThumbs(el);
     }
   },
 };
 function switchRow(key, title, desc, disabled = false) {
-  return `<label class="sw-row ${disabled ? 'disabled' : ''}"><span class="sw-t"><b>${title}</b><small>${desc}</small></span><span class="switch"><input type="checkbox" data-set="${key}" ${S.settings[key] ? 'checked' : ''} ${disabled ? 'disabled' : ''}><i></i></span></label>`;
+  return `<label class="sw-row ${disabled ? 'disabled' : ''}"><span class="sw-t"><b>${title}</b><small>${desc}</small></span><span class="switch"><input type="checkbox" data-set="${esc(key)}" ${S.settings[key] ? 'checked' : ''} ${disabled ? 'disabled' : ''}><i></i></span></label>`;
 }
 
 // ---------------------------------------------------------------------
@@ -1580,10 +1847,10 @@ PAGES.mirror = {
     if (p.has('devices') || p.has('sessions')) {
       const list = connected();
       $('#mirShare').innerHTML = canShareScreen()
-        ? (list.length ? `<p class="muted">Pilih perangkat yang akan menampilkan layar ini:</p><div class="pick-list">${list.map((d) => `<label class="pick"><input type="checkbox" name="mirTo" value="${d.uid}" checked><span>${icon(deviceIcon(d.type), 18)}${esc(d.name)}</span></label>`).join('')}</div><button class="btn primary" data-act="mir-start">${icon('mirror', 18)}Mulai berbagi layar</button>` : noDev())
+        ? (list.length ? `<p class="muted">Pilih perangkat yang akan menampilkan layar ini:</p><div class="pick-list">${list.map((d) => `<label class="pick"><input type="checkbox" name="mirTo" value="${esc(d.uid)}" checked><span>${icon(deviceIcon(d.type), 18)}${esc(d.name)}</span></label>`).join('')}</div><button class="btn primary" data-act="mir-start">${icon('mirror', 18)}Mulai berbagi layar</button>` : noDev())
         : `<div class="notice">${icon('info', 18)}<span>${esc(DEV.label)} tidak dapat membagikan layarnya dari browser (batasan sistem ${esc(DEV.os)}). Perangkat ini tetap bisa <b>menampilkan</b> layar dari Windows atau Mac lewat bagian <b>Lihat layar perangkat lain</b>.</span></div>`;
       const viewers = list.filter((d) => d.features && d.features.screen);
-      $('#mirView').innerHTML = list.length ? (viewers.length ? `<div class="dev-rows">${viewers.map((d) => `<div class="dev-row"><span>${icon(deviceIcon(d.type), 20)}</span><b>${esc(d.name)}</b><button class="btn sm primary" data-act="req-screen" data-uid="${d.uid}">Minta layar</button></div>`).join('')}</div><p class="hint">Perangkat tujuan akan diminta memilih layar yang dibagikan.</p>` : `<div class="notice">${icon('info', 18)}<span>Perangkat terhubung tidak mendukung berbagi layar. Hubungkan Windows atau Mac.</span></div>`) : noDev();
+      $('#mirView').innerHTML = list.length ? (viewers.length ? `<div class="dev-rows">${viewers.map((d) => `<div class="dev-row"><span>${icon(deviceIcon(d.type), 20)}</span><b>${esc(d.name)}</b><button class="btn sm primary" data-act="req-screen" data-uid="${esc(d.uid)}">Minta layar</button></div>`).join('')}</div><p class="hint">Perangkat tujuan akan diminta memilih layar yang dibagikan.</p>` : `<div class="notice">${icon('info', 18)}<span>Perangkat terhubung tidak mendukung berbagi layar. Hubungkan Windows atau Mac.</span></div>`) : noDev();
       renderSessions('screen');
     }
   },
@@ -1602,8 +1869,8 @@ PAGES.camera = {
       const list = connected();
       const cams = list.filter((d) => d.features && d.features.camera);
       const facingSel = (n) => `<select class="select sm" id="${n}"><option value="environment">Kamera belakang</option><option value="user">Kamera depan</option></select>`;
-      $('#camUse').innerHTML = list.length ? (cams.length ? `<div class="row gap wrap">${facingSel('camFacing')}</div><div class="dev-rows">${cams.map((d) => `<div class="dev-row"><span>${icon(deviceIcon(d.type), 20)}</span><b>${esc(d.name)}</b><button class="btn sm primary" data-act="req-cam" data-uid="${d.uid}">Gunakan kamera</button></div>`).join('')}</div>` : `<div class="notice">${icon('info', 18)}<span>Perangkat terhubung tidak memiliki kamera yang bisa dipakai.</span></div>`) : noDev();
-      $('#camShare').innerHTML = canCamera() ? (list.length ? `<div class="row gap wrap">${facingSel('camFacing2')}</div><div class="dev-rows">${list.map((d) => `<div class="dev-row"><span>${icon(deviceIcon(d.type), 20)}</span><b>${esc(d.name)}</b><button class="btn sm" data-act="share-cam" data-uid="${d.uid}">Kirim kamera</button></div>`).join('')}</div>` : noDev()) : `<div class="notice">${icon('info', 18)}<span>Kamera tidak tersedia di perangkat ini.</span></div>`;
+      $('#camUse').innerHTML = list.length ? (cams.length ? `<div class="row gap wrap">${facingSel('camFacing')}</div><div class="dev-rows">${cams.map((d) => `<div class="dev-row"><span>${icon(deviceIcon(d.type), 20)}</span><b>${esc(d.name)}</b><button class="btn sm primary" data-act="req-cam" data-uid="${esc(d.uid)}">Gunakan kamera</button></div>`).join('')}</div>` : `<div class="notice">${icon('info', 18)}<span>Perangkat terhubung tidak memiliki kamera yang bisa dipakai.</span></div>`) : noDev();
+      $('#camShare').innerHTML = canCamera() ? (list.length ? `<div class="row gap wrap">${facingSel('camFacing2')}</div><div class="dev-rows">${list.map((d) => `<div class="dev-row"><span>${icon(deviceIcon(d.type), 20)}</span><b>${esc(d.name)}</b><button class="btn sm" data-act="share-cam" data-uid="${esc(d.uid)}">Kirim kamera</button></div>`).join('')}</div>` : noDev()) : `<div class="notice">${icon('info', 18)}<span>Kamera tidak tersedia di perangkat ini.</span></div>`;
       renderSessions('camera');
     }
   },
@@ -1614,8 +1881,8 @@ function renderSessions(kind) {
   if (!el) return;
   const list = [...S.sessions.values()].filter((s) => s.kind === kind);
   el.innerHTML = list.length ? `<div class="card list-card">${list.map((s) => `<div class="sess-row"><span class="live-dot"></span><span class="sr-t"><b>${s.dir === 'out' ? (kind === 'screen' ? 'Membagikan layar ke ' : 'Membagikan kamera ke ') + esc(devName(s.duid)) : (kind === 'screen' ? 'Layar ' : 'Kamera ') + esc(devName(s.duid))}</b><small>${s.dir === 'out' ? 'Keluar' : 'Masuk'}</small></span>
-    ${s.dir === 'in' && !s.win ? `<button class="btn sm" data-act="sess-open" data-sid="${s.sid}">Tampilkan</button>` : ''}
-    <button class="btn sm danger" data-act="sess-stop" data-sid="${s.sid}">${icon('stop', 14)}${s.dir === 'out' ? 'Hentikan' : 'Tutup'}</button></div>`).join('')}</div>` : `<div class="empty-sm card">Tidak ada sesi aktif.</div>`;
+    ${s.dir === 'in' && !s.win ? `<button class="btn sm" data-act="sess-open" data-sid="${esc(s.sid)}">Tampilkan</button>` : ''}
+    <button class="btn sm danger" data-act="sess-stop" data-sid="${esc(s.sid)}">${icon('stop', 14)}${s.dir === 'out' ? 'Hentikan' : 'Tutup'}</button></div>`).join('')}</div>` : `<div class="empty-sm card">Tidak ada sesi aktif.</div>`;
 }
 
 // ---------------------------------------------------------------------
@@ -1638,7 +1905,7 @@ PAGES.notes = {
     if (p.has('notes') || p.has('notes-list') || p.has('devices')) {
       const q = ($('#noteSearch') && $('#noteSearch').value.toLowerCase()) || '';
       const list = Object.values(S.notes).filter((n) => !n.deleted && (!q || n.body.toLowerCase().includes(q))).sort((a, b) => (b.pinned - a.pinned) || b.updatedAt - a.updatedAt);
-      $('#noteItems').innerHTML = list.length ? list.map((n) => `<button class="note-item ${S.noteSel === n.id ? 'active' : ''}" data-act="note-open" data-id="${n.id}"><b>${n.pinned ? icon('pin', 12) : ''}${esc(noteTitle(n))}</b><small>${fmtTime(n.updatedAt)} · ${esc((n.body.split('\n').filter((x) => x.trim())[1] || '').slice(0, 50) || 'Tidak ada teks tambahan')}</small></button>`).join('') : `<div class="empty-sm">${q ? 'Tidak ditemukan.' : 'Belum ada catatan.'}</div>`;
+      $('#noteItems').innerHTML = list.length ? list.map((n) => `<button class="note-item ${S.noteSel === n.id ? 'active' : ''}" data-act="note-open" data-id="${esc(n.id)}"><b>${n.pinned ? icon('pin', 12) : ''}${esc(noteTitle(n))}</b><small>${fmtTime(n.updatedAt)} · ${esc((n.body.split('\n').filter((x) => x.trim())[1] || '').slice(0, 50) || 'Tidak ada teks tambahan')}</small></button>`).join('') : `<div class="empty-sm">${q ? 'Tidak ditemukan.' : 'Belum ada catatan.'}</div>`;
       if (!p.has('notes-list')) renderNoteEditor();
     }
   },
@@ -1653,12 +1920,12 @@ function renderNoteEditor() {
   }
   const ta = $('#noteBody');
   if (ta && ta.dataset.id === n.id) { if (document.activeElement !== ta && ta.value !== n.body) ta.value = n.body; $('#noteMeta').textContent = noteMeta(n); return; }
-  el.innerHTML = `<div class="ne-head"><button class="icon-btn back-btn" data-act="note-back">${icon('left', 20)}</button><small id="noteMeta">${noteMeta(n)}</small><div class="grow"></div>
+  el.innerHTML = `<div class="ne-head"><button class="icon-btn back-btn" data-act="note-back">${icon('left', 20)}</button><small id="noteMeta">${esc(noteMeta(n))}</small><div class="grow"></div>
       <button class="icon-btn ${n.pinned ? 'on' : ''}" data-act="note-pin" title="Sematkan">${icon('pin', 18)}</button>
       <button class="icon-btn" data-act="note-send" title="Kirim sebagai teks ke perangkat">${icon('send', 18)}</button>
       <button class="icon-btn" data-act="note-copy" title="Salin">${icon('copy', 18)}</button>
       <button class="icon-btn danger" data-act="note-del" title="Hapus">${icon('trash', 18)}</button></div>
-    <textarea id="noteBody" data-id="${n.id}" placeholder="Judul di baris pertama…">${esc(n.body)}</textarea>`;
+    <textarea id="noteBody" data-id="${esc(n.id)}" placeholder="Judul di baris pertama…">${esc(n.body)}</textarea>`;
   const t = $('#noteBody');
   t.addEventListener('input', () => {
     S.lastNoteType = Date.now();
@@ -1668,7 +1935,7 @@ function renderNoteEditor() {
     t._u = setTimeout(() => { PAGES.notes.update(new Set(['notes-list'])); $('#noteMeta').textContent = noteMeta(S.notes[n.id]); }, 500);
   });
 }
-function noteMeta(n) { return `Diubah ${fmtTime(n.updatedAt)}${n.by ? ' di ' + n.by : ''} · tersinkron ke ${connected().length} perangkat`; }
+function noteMeta(n) { return `Diubah ${fmtTime(n.updatedAt)}${n.by ? ' di ' + n.by : ''} · tersinkron ke ${connected().length} perangkat`; } // teks biasa
 function flushNoteEdit() {}
 
 // ---------------------------------------------------------------------
@@ -1682,7 +1949,7 @@ PAGES.files = {
       <button data-act="ftab" data-tab="mine">${icon('folderUp', 16)}Dibagikan dari sini</button>
       <button data-act="ftab" data-tab="recv">${icon('download', 16)}Diterima</button>
     </div>
-    <div class="row gap wrap filt" id="fFilt">${FILTERS.map(([k, l]) => `<button class="chip-btn" data-act="ffilt" data-f="${k}">${l}</button>`).join('')}</div>
+    <div class="row gap wrap filt" id="fFilt">${FILTERS.map(([k, l]) => `<button class="chip-btn" data-act="ffilt" data-f="${esc(k)}">${l}</button>`).join('')}</div>
     <div id="fBody"></div>`,
   mount() { this.update(new Set(['files'])); },
   update(p) {
@@ -1697,17 +1964,17 @@ PAGES.files = {
       if (!S.filesDev || !list.some((d) => d.uid === S.filesDev)) S.filesDev = list[0].uid;
       const d = devOf(S.filesDev);
       const items = (d.shared || []).filter(flt);
-      body.innerHTML = `<div class="row gap wrap dev-pills">${list.map((x) => `<button class="pill ${x.uid === S.filesDev ? 'active' : ''}" data-act="fdev" data-uid="${x.uid}">${icon(deviceIcon(x.type), 16)}${esc(x.name)} <em>${(x.shared || []).length}</em></button>`).join('')}</div>` +
-        (items.length ? `<div class="f-grid">${items.map((x) => fileTile(x, `<button class="btn sm primary" data-act="fget" data-id="${x.id}">${icon('download', 14)}Ambil</button>`)).join('')}</div>`
+      body.innerHTML = `<div class="row gap wrap dev-pills">${list.map((x) => `<button class="pill ${x.uid === S.filesDev ? 'active' : ''}" data-act="fdev" data-uid="${esc(x.uid)}">${icon(deviceIcon(x.type), 16)}${esc(x.name)} <em>${(x.shared || []).length}</em></button>`).join('')}</div>` +
+        (items.length ? `<div class="f-grid">${items.map((x) => fileTile(x, `<button class="btn sm primary" data-act="fget" data-id="${esc(x.id)}">${icon('download', 14)}Ambil</button>`)).join('')}</div>`
           : `<div class="card empty-sm">${icon('folder', 30)}<br><b>${esc(d.name)}</b> belum membagikan berkas${S.filesFilter !== 'all' ? ' jenis ini' : ''}.<br><small>Di ${esc(d.name)}, buka <b>Akses Berkas → Dibagikan dari sini</b> lalu tambahkan berkas atau folder.</small></div>`);
     } else if (S.filesTab === 'mine') {
       const items = S.myShared.filter(flt);
       body.innerHTML = `<div class="card share-bar"><div><b>Bagikan berkas ke semua perangkat terhubung</b><small>Perangkat lain bisa menjelajah dan mengambil berkas ini kapan saja selama terhubung.</small></div><div class="row gap"><button class="btn primary" data-act="share-add">${icon('plus', 16)}Tambah berkas</button>${!isIOS() ? `<button class="btn" data-act="share-add-dir">${icon('folderUp', 16)}Tambah folder</button>` : ''}${isIOS() || /Android/.test(navigator.userAgent) ? `<button class="btn" data-act="share-add-photo">${icon('image', 16)}Foto & video</button>` : ''}</div></div>` +
-        (items.length ? `<div class="f-grid">${items.map((x) => fileTile(x, `<button class="btn sm ghost" data-act="share-rm" data-id="${x.id}">${icon('trash', 14)}Hapus</button>`, true)).join('')}</div>` : `<div class="card empty-sm">${icon('folderUp', 30)}<br>Belum ada berkas yang dibagikan.</div>`);
+        (items.length ? `<div class="f-grid">${items.map((x) => fileTile(x, `<button class="btn sm ghost" data-act="share-rm" data-id="${esc(x.id)}">${icon('trash', 14)}Hapus</button>`, true)).join('')}</div>` : `<div class="card empty-sm">${icon('folderUp', 30)}<br>Belum ada berkas yang dibagikan.</div>`);
     } else {
       const items = S.received.filter(flt);
       body.innerHTML = `<div class="row between recv-bar"><small class="muted" id="storeInfo">${S.received.length} berkas</small>${S.received.length ? `<button class="btn sm ghost" data-act="recv-clear">${icon('trash', 14)}Hapus semua</button>` : ''}</div>` +
-        (items.length ? `<div class="f-grid">${items.map((x) => fileTile(x, `<button class="btn sm" data-act="save-file" data-fid="${x.id}">${icon('download', 14)}Simpan</button>${isIOS() ? `<button class="btn sm" data-act="share-file" data-fid="${x.id}">${icon('share', 14)}</button>` : ''}<button class="btn sm ghost" data-act="recv-del" data-id="${x.id}">${icon('trash', 14)}</button>`, true, x.fromName)).join('')}</div>` : `<div class="card empty-sm">${icon('download', 30)}<br>Belum ada berkas diterima.</div>`);
+        (items.length ? `<div class="f-grid">${items.map((x) => fileTile(x, `<button class="btn sm" data-act="save-file" data-fid="${esc(x.id)}">${icon('download', 14)}Simpan</button>${isIOS() ? `<button class="btn sm" data-act="share-file" data-fid="${esc(x.id)}">${icon('share', 14)}</button>` : ''}<button class="btn sm ghost" data-act="recv-del" data-id="${esc(x.id)}">${icon('trash', 14)}</button>`, true, x.fromName)).join('')}</div>` : `<div class="card empty-sm">${icon('download', 30)}<br>Belum ada berkas diterima.</div>`);
       if (navigator.storage && navigator.storage.estimate) navigator.storage.estimate().then((e) => { const s = $('#storeInfo'); if (s) s.textContent = `${S.received.length} berkas · memakai ${fmtSize(e.usage)} penyimpanan browser`; });
     }
     hydrateThumbs(body);
@@ -1715,8 +1982,8 @@ PAGES.files = {
 };
 function fileTile(x, acts, local = false, from = '') {
   const k = fileKind(x.mime, x.name);
-  const thumb = x.thumb ? `<img src="${x.thumb}" alt="">` : (local && k === 'image' ? `<img data-fid="${x.id}" alt="">` : `<span class="ft-ic ${k}">${icon(kindIcon(k), 30)}<em>${esc(extOf(x.name))}</em></span>`);
-  return `<div class="f-tile"><button class="ft-thumb" ${local ? `data-act="preview" data-fid="${x.id}"` : ''}>${thumb}</button><div class="ft-info"><b title="${esc(x.name)}">${esc(x.name)}</b><small>${fmtSize(x.size)} · ${fmtTime(x.ts)}${from ? ' · ' + esc(from) : ''}</small></div><div class="ft-acts">${acts}</div></div>`;
+  const thumb = x.thumb ? `<img src="${esc(x.thumb)}" alt="">` : (local && k === 'image' ? `<img data-fid="${esc(x.id)}" alt="">` : `<span class="ft-ic ${k}">${icon(kindIcon(k), 30)}<em>${esc(extOf(x.name))}</em></span>`);
+  return `<div class="f-tile"><button class="ft-thumb" ${local ? `data-act="preview" data-fid="${esc(x.id)}"` : ''}>${thumb}</button><div class="ft-info"><b title="${esc(x.name)}">${esc(x.name)}</b><small>${fmtSize(x.size)} · ${fmtTime(x.ts)}${from ? ' · ' + esc(from) : ''}</small></div><div class="ft-acts">${acts}</div></div>`;
 }
 
 // ---------------------------------------------------------------------
@@ -1734,7 +2001,7 @@ PAGES.settings = {
         <div class="set-row"><span class="sr-ic">${icon('refresh', 20)}</span><div class="sr-t"><b>Buat kode baru</b><small>Perangkat tepercaya tetap tersimpan, tetapi perlu dihubungkan ulang dari perangkat ini.</small></div><button class="btn sm" data-act="new-code">Buat ulang</button></div>
       </section>
       <section class="card set-sec"><h3>Tampilan</h3>
-        <div class="seg" role="radiogroup">${[['auto', 'Otomatis'], ['light', 'Terang'], ['dark', 'Gelap']].map(([k, l]) => `<button class="${S.settings.theme === k ? 'active' : ''}" data-act="theme" data-v="${k}">${icon(k === 'dark' ? 'moon' : k === 'light' ? 'sun' : 'sparkle', 16)}${l}</button>`).join('')}</div>
+        <div class="seg" role="radiogroup">${[['auto', 'Otomatis'], ['light', 'Terang'], ['dark', 'Gelap']].map(([k, l]) => `<button class="${S.settings.theme === k ? 'active' : ''}" data-act="theme" data-v="${esc(k)}">${icon(k === 'dark' ? 'moon' : k === 'light' ? 'sun' : 'sparkle', 16)}${l}</button>`).join('')}</div>
         ${switchRow('sound', 'Bunyi pemberitahuan', 'Bunyi lembut saat menerima berkas, pesan, atau sambungan baru.')}
       </section>
       <section class="card set-sec"><h3>Sambungan</h3>
@@ -1742,9 +2009,9 @@ PAGES.settings = {
         <div class="set-row"><span class="sr-ic">${icon('globe', 20)}</span><div class="sr-t"><b>Status server</b><small id="cxStatus">${netStateHtml()}</small></div><button class="btn sm" data-act="kick">${icon('refresh', 14)}Sambung ulang</button></div>
       </section>
       <section class="card set-sec"><h3>Perangkat tepercaya</h3>
-        ${tr.length ? tr.map((t) => `<div class="set-row"><span class="sr-ic">${icon(deviceIcon(t.type), 20)}</span><div class="sr-t"><b>${esc(t.name)}</b><small>${esc(t.os || '')} · Kode ${fmtCode(t.code)} · ${devOf(t.uid) && devOf(t.uid).ready ? '<span class="ok-t">Terhubung</span>' : 'terakhir ' + fmtAgo(t.lastSeen || 0)}</small></div>
-          ${devOf(t.uid) && devOf(t.uid).ready ? `<button class="btn sm" data-act="disconnect" data-uid="${t.uid}">Putuskan</button>` : `<button class="btn sm" data-act="reconnect" data-uid="${t.uid}">Hubungkan</button>`}
-          <button class="btn sm ghost danger" data-act="forget" data-uid="${t.uid}">Lupakan</button></div>`).join('') : `<p class="muted">Belum ada. Perangkat yang Anda izinkan akan muncul di sini.</p>`}
+        ${tr.length ? tr.map((t) => `<div class="set-row"><span class="sr-ic">${icon(deviceIcon(t.type), 20)}</span><div class="sr-t"><b>${esc(t.name)}</b><small>${esc(t.os || '')} · Kode ${fmtCode(t.code)} · ${devOf(t.uid) && devOf(t.uid).ready ? '<span class="ok-t">Terhubung</span>' : t.needsPair ? '<span class="warn-t">Perlu dipasangkan ulang</span>' : 'terakhir ' + fmtAgo(t.lastSeen || 0)}</small></div>
+          ${devOf(t.uid) && devOf(t.uid).ready ? `<button class="btn sm" data-act="disconnect" data-uid="${esc(t.uid)}">Putuskan</button>` : `<button class="btn sm" data-act="reconnect" data-uid="${esc(t.uid)}">Hubungkan</button>`}
+          <button class="btn sm ghost danger" data-act="forget" data-uid="${esc(t.uid)}">Lupakan</button></div>`).join('') : `<p class="muted">Belum ada. Perangkat yang Anda izinkan akan muncul di sini.</p>`}
       </section>
       <section class="card set-sec"><h3>Penyimpanan</h3>
         ${window.showDirectoryPicker ? `<div class="set-row"><span class="sr-ic">${icon('folder', 20)}</span><div class="sr-t"><b>Simpan otomatis ke folder</b><small>${S.dirHandle ? `Aktif: folder <b>${esc(S.dirHandle.name)}</b>. Berkas diterima langsung ditulis ke folder ini.` : S.dirPending ? `Folder <b>${esc(S.dirPending.name)}</b> perlu izin ulang.` : 'Pilih folder di komputer ini; berkas yang diterima akan langsung tersimpan di sana.'}</small></div>
@@ -1759,7 +2026,7 @@ PAGES.settings = {
       </section>
       <section class="card set-sec"><h3>Lanjutan</h3>
         <div class="set-row"><span class="sr-ic">${icon('globe', 20)}</span><div class="sr-t"><b>Server sinyal</b><small>${esc(S.settings.signal || DEFAULT_SIGNAL)}<br>Hanya untuk mempertemukan perangkat; berkas tidak pernah melewati server ini.</small></div><button class="btn sm" data-act="set-signal">Ubah</button></div>
-        <div class="set-row"><span class="sr-ic">${icon('info', 20)}</span><div class="sr-t"><b>Taut ${VERSION}</b><small>Data dikirim langsung antar perangkat (WebRTC, terenkripsi DTLS). <a href="#" data-act="welcome">Lihat pengenalan</a></small></div></div>
+        <div class="set-row"><span class="sr-ic">${icon('shield', 20)}</span><div class="sr-t"><b>Taut ${VERSION}</b><small>Data dikirim langsung antar perangkat (WebRTC, terenkripsi DTLS). Perangkat tepercaya diverifikasi dengan kunci rahasia yang tidak pernah dikirim ulang. <a href="#" data-act="welcome">Lihat pengenalan</a></small></div></div>
       </section>`;
   },
 };
@@ -1818,7 +2085,7 @@ function openConnect() {
         <form class="code-form" id="codeForm"><input id="codeIn" inputmode="numeric" autocomplete="off" maxlength="7" placeholder="000 000" aria-label="Kode perangkat"><button class="btn primary" type="submit">Hubungkan</button></form>
         ${canCamera() ? `<button class="btn wide" data-act="scan">${icon('scan', 18)}Pindai kode QR perangkat lain</button>` : ''}
         <div id="connStatus" class="conn-status"></div>
-        ${tr.length ? `<div class="cx-trusted"><small class="muted">Perangkat tepercaya</small>${tr.slice(0, 4).map((t) => `<button class="tr-chip" data-act="reconnect" data-uid="${t.uid}">${icon(deviceIcon(t.type), 16)}${esc(t.name)}</button>`).join('')}</div>` : ''}
+        ${tr.length ? `<div class="cx-trusted"><small class="muted">Perangkat tepercaya</small>${tr.slice(0, 4).map((t) => `<button class="tr-chip" data-act="reconnect" data-uid="${esc(t.uid)}">${icon(deviceIcon(t.type), 16)}${esc(t.name)}</button>`).join('')}</div>` : ''}
       </div>
     </div>`,
     onClose: () => { if (S.connecting && S.connecting.state === 'connecting') { /* biarkan berjalan */ } },
@@ -1838,17 +2105,35 @@ function setConnStatus(kind, html, cancel = false) {
 }
 
 function showRequest(req) {
-  const h = req.hello || {};
+  const raw = isObj(req.hello) ? req.hello : {};
+  const from = req.from;
+  // Salam dari server sinyal tidak tepercaya: validasi ketat
+  if (!okUid(raw.uid) || raw.code !== from || raw.uid === me.uid || raw.pv !== PROTO) { req.reject(); return; }
+  if (raw.auto === true) { req.reject(); return; }                    // sambungan latar dari perangkat yang tidak kita kenal
+  if ((S.cooldown.get(from) || 0) > Date.now()) { req.reject(); return; } // baru saja ditolak
+  if (!S.reqs.has(from) && S.reqs.size >= 3) { req.reject(); return; }   // batasi banjir permintaan
+  const prev = S.reqs.get(from);
+  if (prev) prev.superseded = true;
+  const h = { uid: raw.uid, name: cleanName(raw.name, 40) || 'Perangkat', type: TYPES.has(raw.type) ? raw.type : 'phone', os: OSES.has(raw.os) ? raw.os : 'Lainnya' };
+  const st = { superseded: false };
+  S.reqs.set(from, st);
   if (S.settings.sound) chime();
-  notify('Permintaan sambungan', `${h.name || 'Perangkat'} ingin terhubung`);
+  notify('Permintaan sambungan', `${h.name} ingin terhubung`);
+  // Peringatan penyamaran: nama sama dengan perangkat tepercaya, tetapi identitas berbeda
+  const lookalike = Object.values(S.trusted).find((t) => t.uid !== h.uid && t.name.toLowerCase() === h.name.toLowerCase());
+  let done = false;
+  const finish = () => { done = true; if (S.reqs.get(from) === st) S.reqs.delete(from); };
   modal({
-    id: 'req-' + req.from, icon: 'shield', title: 'Permintaan sambungan', dismiss: false,
-    body: `<div class="req-card"><div class="req-art">${deviceArt(h.type || 'phone')}</div><div><b class="rc-name">${esc(h.name || 'Perangkat')}</b><small>${esc(h.os || '')} · Kode ${fmtCode(req.from)}</small><p>ingin terhubung ke <strong>${esc(me.name)}</strong>. Setelah diizinkan, keduanya akan tersambung otomatis di lain waktu.</p></div></div>`,
+    id: 'req-' + from, icon: 'shield', title: 'Permintaan sambungan', dismiss: false,
+    body: `<div class="req-card"><div class="req-art">${deviceArt(h.type)}</div><div><b class="rc-name">${esc(h.name)}</b><small>${esc(h.os)} · Kode ${fmtCode(from)}</small><p>ingin terhubung ke <strong>${esc(me.name)}</strong>. Izinkan hanya perangkat yang Anda kenal. Setelah diizinkan, keduanya tersambung otomatis di lain waktu.</p></div></div>
+      ${lookalike ? `<div class="notice warn">${icon('shield', 18)}<span><b>Hati-hati:</b> namanya sama dengan perangkat tepercaya Anda, tetapi ini perangkat yang <b>berbeda</b>. Tolak jika Anda tidak sedang menghubungkan perangkat baru.</span></div>` : ''}`,
     actions: [
-      { label: 'Tolak', fn: () => req.reject() },
-      { label: 'Izinkan', primary: true, fn: () => { req.accept(); } },
+      { label: 'Tolak', fn: () => { finish(); S.cooldown.set(from, Date.now() + 60000); req.reject(); } },
+      { label: 'Izinkan', primary: true, fn: () => { finish(); req.accept({ approved: true }); } },
     ],
+    onClose: () => { if (!done) { finish(); if (!st.superseded) req.reject(); } },
   });
+  setTimeout(() => { if (!done && S.reqs.get(from) === st) closeModal('req-' + from); }, 55000);
 }
 
 // ---------- Pemindai QR ----------
@@ -1979,7 +2264,7 @@ const ACT = {
   more: () => {
     modal({
       id: 'more', title: 'Semua fitur', icon: 'grid',
-      body: `<div class="more-grid">${[...NAV, { id: 'settings', label: 'Pengaturan', ic: 'settings' }].map((n) => `<button data-page="${n.id}">${icon(n.ic, 24)}<span>${n.short || n.label}</span>${S.unread[n.id] ? `<i class="badge show">${S.unread[n.id]}</i>` : ''}</button>`).join('')}</div>`,
+      body: `<div class="more-grid">${[...NAV, { id: 'settings', label: 'Pengaturan', ic: 'settings' }].map((n) => `<button data-page="${esc(n.id)}">${icon(n.ic, 24)}<span>${n.short || n.label}</span>${S.unread[n.id] ? `<i class="badge show">${S.unread[n.id]}</i>` : ''}</button>`).join('')}</div>`,
     });
   },
   rename: async () => { const v = await ask({ title: 'Ganti nama perangkat', label: 'Nama yang terlihat di perangkat lain', value: me.name }); if (v && v.trim()) setName(v.trim()); },
@@ -2010,12 +2295,12 @@ const ACT = {
     modal({
       id: 'dm', title: esc(d.name), icon: deviceIcon(d.type),
       body: `<div class="menu-list">
-        <button data-act="open-dev" data-uid="${u}">${icon('transfer', 18)}Buka percakapan transfer</button>
-        <button data-act="send-link-to" data-uid="${u}">${icon('handoff', 18)}Kirim tautan/teks</button>
-        <button data-act="ring" data-uid="${u}">${icon('ring', 18)}Bunyikan perangkat</button>
-        <button data-act="fdev-open" data-uid="${u}">${icon('folder', 18)}Lihat berkas yang dibagikan</button>
-        <button data-act="disconnect" data-uid="${u}" class="danger">${icon('unlink', 18)}Putuskan sambungan</button>
-        <button data-act="forget" data-uid="${u}" class="danger">${icon('trash', 18)}Lupakan perangkat</button></div>`,
+        <button data-act="open-dev" data-uid="${esc(u)}">${icon('transfer', 18)}Buka percakapan transfer</button>
+        <button data-act="send-link-to" data-uid="${esc(u)}">${icon('handoff', 18)}Kirim tautan/teks</button>
+        <button data-act="ring" data-uid="${esc(u)}">${icon('ring', 18)}Bunyikan perangkat</button>
+        <button data-act="fdev-open" data-uid="${esc(u)}">${icon('folder', 18)}Lihat berkas yang dibagikan</button>
+        <button data-act="disconnect" data-uid="${esc(u)}" class="danger">${icon('unlink', 18)}Putuskan sambungan</button>
+        <button data-act="forget" data-uid="${esc(u)}" class="danger">${icon('trash', 18)}Lupakan perangkat</button></div>`,
     });
   },
   'send-link-to': async (b) => { closeModal('dm'); const u = b.dataset.uid; const v = await ask({ title: `Kirim ke ${esc(devName(u))}`, label: 'Tautan atau teks', placeholder: 'https://…', ok: 'Kirim' }); if (v && v.trim()) sendText(u, v.trim()); },
@@ -2035,6 +2320,7 @@ const ACT = {
         const d = devOf(u);
         if (d && d.link) { d.link.send({ t: 'forget' }); const l = d.link; setTimeout(() => l.close('bye-local'), 150); }
         delete S.trusted[u]; save.trusted();
+        delKey(u);
         LS.del('tl.' + u); delete S.tl[u];
         if (S.sel === u) S.sel = null;
         refresh('devices'); refresh('settings');
@@ -2042,7 +2328,7 @@ const ACT = {
     });
   },
   reconnect: (b) => {
-    const t = S.trusted[b.dataset.uid];
+    const t = trustOf(b.dataset.uid);
     if (!t) return;
     if (!modals.has('connect')) openConnect();
     startConnect(t.code);
@@ -2106,9 +2392,11 @@ const ACT = {
   install: () => doInstall(),
   welcome: () => showWelcome(),
   'set-signal': async () => {
-    const v = await ask({ title: 'Server sinyal', label: 'Alamat WebSocket server PeerJS (kosongkan untuk bawaan)', value: S.settings.signal || '', placeholder: DEFAULT_SIGNAL });
+    const v = await ask({ title: 'Server sinyal', label: 'Alamat wss:// server PeerJS (kosongkan untuk bawaan)', value: S.settings.signal || '', placeholder: DEFAULT_SIGNAL });
     if (v === null) return;
-    S.settings.signal = v.trim(); save.settings();
+    const u = v.trim();
+    if (u && !okSignal(u)) { toast('Alamat harus diawali wss:// dan berupa alamat server yang valid.', { icon: 'x' }); return; }
+    S.settings.signal = u; save.settings();
     toast('Disimpan. Memuat ulang…', { icon: 'refresh' });
     setTimeout(() => location.reload(), 600);
   },
@@ -2120,7 +2408,7 @@ function pickDevice(title, ic, fn) {
   if (list.length === 1) { fn(list[0].uid); return; }
   const m = modal({
     id: 'pick', title, icon: ic,
-    body: `<div class="menu-list">${list.map((d) => `<button data-pick="${d.uid}">${icon(deviceIcon(d.type), 18)}${esc(d.name)}</button>`).join('')}</div>`,
+    body: `<div class="menu-list">${list.map((d) => `<button data-pick="${esc(d.uid)}">${icon(deviceIcon(d.type), 18)}${esc(d.name)}</button>`).join('')}</div>`,
   });
   m.el.addEventListener('click', (e) => { const b = e.target.closest('[data-pick]'); if (b) { m.close(); fn(b.dataset.pick); } });
 }
@@ -2132,11 +2420,16 @@ async function preview(fid) {
   const meta = await fileMeta(fid);
   const k = fileKind(blob.type || meta.mime, meta.name);
   const url = await blobUrl(fid);
+  if (!url) return;
   let body;
-  if (k === 'image') body = `<img class="pv-media" src="${url}" alt="">`;
-  else if (k === 'video') body = `<video class="pv-media" src="${url}" controls playsinline autoplay></video>`;
-  else if (k === 'audio') body = `<div class="pv-audio">${icon('audio', 48)}<audio src="${url}" controls autoplay></audio></div>`;
-  else if (/pdf/.test(blob.type) || /\.pdf$/i.test(meta.name)) body = `<iframe class="pv-doc" src="${url}"></iframe>`;
+  if (k === 'image') body = `<img class="pv-media" src="${esc(url)}" alt="">`;
+  else if (k === 'video') body = `<video class="pv-media" src="${esc(url)}" controls playsinline autoplay></video>`;
+  else if (k === 'audio') body = `<div class="pv-audio">${icon('audio', 48)}<audio src="${esc(url)}" controls autoplay></audio></div>`;
+  else if (/pdf/.test(blob.type) || /\.pdf$/i.test(meta.name)) {
+    const pu = URL.createObjectURL(new Blob([blob], { type: 'application/pdf' }));
+    setTimeout(() => URL.revokeObjectURL(pu), 600000);
+    body = `<iframe class="pv-doc" src="${esc(pu)}" title="Pratinjau PDF"></iframe>`;
+  }
   else if ((blob.type.startsWith('text/') || /\.(txt|md|csv|json|js|css|html?|xml|py|log)$/i.test(meta.name)) && blob.size < 2e6) body = `<pre class="pv-text">${esc(await blob.text())}</pre>`;
   else body = `<div class="pv-none">${icon(kindIcon(k), 56)}<b>${esc(meta.name)}</b><small>${fmtSize(blob.size)}</small><p>Pratinjau tidak tersedia untuk jenis berkas ini.</p></div>`;
   modal({
@@ -2167,7 +2460,14 @@ setInterval(() => { if (!document.hidden) connected().forEach(updateStats); }, 4
 // =====================================================================
 // MULAI
 // =====================================================================
-let pendingHashCode = null;
+// Kode dari tautan/QR hanya diisikan; pengguna tetap harus menekan Hubungkan sendiri
+function offerCode(code) {
+  if (!okCode(code)) return;
+  if (!modals.has('connect')) openConnect();
+  const inp = $('#codeIn');
+  if (inp) inp.value = fmtCode(code);
+  setConnStatus('ok', `Tautan berisi kode <b>${fmtCode(code)}</b>. Tekan <b>Hubungkan</b> jika Anda mengenali perangkat tersebut.`);
+}
 function boot() {
   applyTheme();
   shell();
@@ -2240,12 +2540,10 @@ function boot() {
   window.addEventListener('online', () => { net.signal.kick(); });
   // Tautan QR dibuka saat Taut sudah terbuka di tab ini
   window.addEventListener('hashchange', () => {
-    const m2 = location.hash.match(/#k=(\d{6})/);
+    const m2 = location.hash.match(/^#k=(\d{6})$/);
     if (m2) {
       history.replaceState(null, '', '#' + S.page);
-      if (m2[1] === me.code) return;
-      if (!modals.has('connect')) openConnect();
-      if (net.signal.state === 'online') startConnect(m2[1]); else pendingHashCode = m2[1];
+      if (m2[1] !== me.code) offerCode(m2[1]);
     } else {
       const pg = location.hash.slice(1);
       if (PAGES[pg] && pg !== S.page) go(pg);
@@ -2256,7 +2554,7 @@ function boot() {
   window.addEventListener('appinstalled', () => { S.installEvt = null; toast('Taut terpasang!', { icon: 'check', kind: 'ok' }); });
   window.addEventListener('pagehide', () => { for (const l of net.openLinks()) l.send({ t: 'bye' }); });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { const last = [...modals.keys()].pop(); if (last && !last.startsWith('req-')) closeModal(last); }
+    if (e.key === 'Escape') { const last = [...modals.entries()].pop(); if (last && last[1].dismiss) closeModal(last[0]); }
   });
 
   // Baterai
@@ -2269,16 +2567,15 @@ function boot() {
 
   // Kode dari QR (#k=123456)
   const h = location.hash;
-  const km = h.match(/#k=(\d{6})/);
-  if (km && km[1] !== me.code) pendingHashCode = km[1];
+  const km = h.match(/^#k=(\d{6})$/);
   const start = km ? 'home' : (h.replace('#', '') || 'home');
   go(PAGES[start] ? start : 'home');
-  if (km && km[1] !== me.code) { openConnect(); setConnStatus('wait', `Menyambung ke server… lalu menghubungkan ke ${fmtCode(km[1])}.`, false); }
+  if (km && km[1] !== me.code) offerCode(km[1]);
 
   if (firstRun || !LS.get('welcomed')) { if (!km) showWelcome(); else LS.set('welcomed', true); }
 
   Promise.all([loadFiles(), loadDirHandle(), checkClipPerm()]).then(() => refresh('files'));
-  startNet();
+  loadKeys().finally(() => startNet());
 
   // Dibagikan dari aplikasi lain (share target Android/Chrome)
   if (qs.has('share')) {
@@ -2286,7 +2583,7 @@ function boot() {
     history.replaceState(null, '', location.pathname + '#home');
     if (txt) S.pendingShare = txt;
   }
-  if (qs.has('debug')) window.__taut = { S, net, me, sendFiles, sendText, sendClipText, newNote, editNote, addShared, go, connected, linkOf };
+  if (DEV_HOST && qs.has('debug')) window.__taut = { S, net, me, KEYS, sendFiles, sendText, sendClipText, newNote, editNote, addShared, go, connected, linkOf };
 
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
     navigator.serviceWorker.register('sw.js').catch(() => {});
@@ -2301,7 +2598,8 @@ function startNet() {
   const tab = uid(6);
   let other = false;
   bc.onmessage = (e) => {
-    const m = e.data || {};
+    const m = isObj(e.data) ? e.data : {};
+    if (typeof m.tab !== 'string') return;
     if (m.t === 'hi' && m.tab !== tab && net.signal.state !== 'offline') bc.postMessage({ t: 'here', tab });
     if (m.t === 'here' && m.tab !== tab) other = true;
     if (m.t === 'take' && m.tab !== tab) {

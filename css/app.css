@@ -774,3 +774,9 @@ kbd { font: 600 11.5px var(--font); padding: 1px 6px; border-radius: 6px; border
 @media (hover: none) {
   .b-acts { display: flex; }
 }
+
+/* ---------- keamanan ---------- */
+.notice.warn { background: var(--warn-soft); color: var(--text); margin-top: 14px; }
+.notice.warn .ic { color: var(--warn); }
+.warn-t { color: var(--warn); font-weight: 600; }
+.sas { font-variant-numeric: tabular-nums; letter-spacing: .14em; font-size: 15px; padding: 1px 8px; border-radius: 7px; background: var(--ok-soft); color: var(--ok); }
