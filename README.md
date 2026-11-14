@@ -1,4 +1,8 @@
+<p align="center"><img src="img/logo.png" width="120" alt="Logo TJKT SMKN 1 Murung Pudak"></p>
+
 # Taut — Kit Kerja Lintas Perangkat
+
+Dikembangkan untuk **TJKT SMK Negeri 1 Murung Pudak**.
 
 Taut menghubungkan **iPad, Windows, Mac, dan HP** dalam satu alur kerja — langsung dari browser, tanpa kabel, tanpa instal driver.
 

@@ -5,14 +5,14 @@ import {
   makeThumb, downloadBlob, shareBlob, makeZip, chime, audioCtx, loadScript,
   isObj, hasOwn, okKey, okUid, okCode, okId, dict, safeInt, cleanStr, cleanName, cleanFileName, safeMime, safeBlob, okThumb,
   enc, hex, unhex, randHex, b64, unb64,
-} from './util.js?v=1.1.1';
-import { icon, kindIcon, deviceIcon, logo, deviceArt } from './icons.js?v=1.1.1';
-import { Net, DEFAULT_SIGNAL, LIMITS } from './net.js?v=1.1.1';
+} from './util.js?v=1.2.0';
+import { icon, kindIcon, deviceIcon, logo, stopLogo, deviceArt } from './icons.js?v=1.2.0';
+import { Net, DEFAULT_SIGNAL, LIMITS } from './net.js?v=1.2.0';
 
 // Tolak dijalankan di dalam bingkai halaman lain (mencegah clickjacking pada tombol Izinkan)
 if (window.__tautFramed) throw new Error('Taut tidak boleh dibuka di dalam bingkai.');
 
-const VERSION = '1.1.1';
+const VERSION = '1.2.0';
 const PROTO = 2; // versi protokol jabat tangan
 const DEV_HOST = ['localhost', '127.0.0.1'].includes(location.hostname);
 const TYPES = new Set(['phone', 'tablet', 'laptop', 'desktop']);
@@ -1432,7 +1432,7 @@ const TABS = ['home', 'transfer', 'clipboard', 'notes'];
 
 function shell() {
   $('#sidebar').innerHTML = `
-    <div class="brand">${logo(34)}<div class="brand-t"><b>Taut</b><span>Kit Kerja Lintas Perangkat</span></div></div>
+    <div class="brand">${logo(42)}<div class="brand-t"><b>Taut</b><span>Kit Kerja Lintas Perangkat</span></div></div>
     <button class="me-card" data-act="connect" id="meCard"></button>
     <nav class="nav">${NAV.map((n) => `<button class="nav-item" data-page="${esc(n.id)}" title="${esc(n.label)}">${icon(n.ic, 20)}<span>${n.label}</span><i class="badge" data-badge="${esc(n.id)}"></i></button>`).join('')}</nav>
     <div class="side-sec"><span>Perangkat terhubung</span><button class="mini-btn" data-act="connect" title="Hubungkan perangkat">${icon('plus', 16)}</button></div>
@@ -2185,9 +2185,10 @@ function showWelcome() {
   const el = document.createElement('div');
   el.className = 'welcome';
   el.innerHTML = `
-    <header class="w-nav">${logo(30)}<b>Taut</b><span class="grow"></span><a href="#w-fitur">Fitur</a><a href="#w-cara">Cara pakai</a><button class="btn sm primary" data-w="start">Buka aplikasi</button></header>
+    <header class="w-nav">${logo(36)}<b>Taut</b><span class="grow"></span><a href="#w-fitur">Fitur</a><a href="#w-cara">Cara pakai</a><button class="btn sm primary" data-w="start">Buka aplikasi</button></header>
     <section class="w-hero">
       <div class="w-hero-t">
+        <div class="w-logo">${logo(120)}<div><b>TJKT</b><span>SMK Negeri 1 Murung Pudak</span></div></div>
         <span class="eyebrow">Untuk iPad · Windows · Mac · HP</span>
         <h1>Satu alur kerja.<br><span class="grad">Semua perangkat.</span></h1>
         <p>Taut menghubungkan iPad, laptop Windows, Mac, dan HP Anda untuk transfer berkas, papan klip bersama, pencerminan layar, kamera bersama, dan catatan yang selalu sinkron — langsung dari browser, tanpa kabel.</p>
@@ -2493,7 +2494,10 @@ function boot() {
   });
   $('#btnConnect').addEventListener('click', openConnect);
   $('#netPill').addEventListener('click', openConnect);
-  $('#logoTop').innerHTML = logo(28);
+  $('#logoTop').innerHTML = logo(34);
+  // Logo bergerak diputar sekali, lalu berhenti di gambar utuh
+  document.addEventListener('load', (e) => { const t = e.target; if (t && t.tagName === 'IMG' && t.dataset.logo) stopLogo(t); }, true);
+  document.querySelectorAll('img[data-logo]').forEach((i) => { if (i.complete && i.naturalWidth) stopLogo(i); });
 
   // Tempel global → papan klip / transfer
   document.addEventListener('paste', async (e) => {

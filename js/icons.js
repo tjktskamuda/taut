@@ -82,8 +82,25 @@ export function deviceIcon(type) {
 }
 
 // Logo Taut: dua cincin yang saling bertaut
+// Logo TJKT SMKN 1 Murung Pudak. Versi bergerak diputar sekali saat aplikasi
+// dibuka, lalu diganti gambar diam (frame terakhir) — lihat stopLogo().
+export const LOGO_STATIC = 'img/logo.png';
+export const LOGO_MS = 12000;
+const logoDone = new Set();
 export function logo(size = 32) {
-  return `<svg width="${size}" height="${size}" viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="tg${size}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4C8DFF"/><stop offset="1" stop-color="#2A4FE0"/></linearGradient></defs><rect width="64" height="64" rx="16" fill="url(#tg${size})"/><rect x="13" y="20" width="24" height="24" rx="8" fill="none" stroke="#fff" stroke-width="5"/><rect x="27" y="20" width="24" height="24" rx="8" fill="none" stroke="#fff" stroke-opacity=".75" stroke-width="5"/></svg>`;
+  const anim = size > 64 ? 'img/logo-240.webp' : 'img/logo-128.webp';
+  const src = logoDone.has(anim) ? LOGO_STATIC : anim;
+  return `<picture class="logo"><source media="(prefers-reduced-motion: reduce)" srcset="${LOGO_STATIC}"><img src="${src}" width="${size}" height="${size}" alt="Logo TJKT SMKN 1 Murung Pudak" draggable="false" data-logo="${anim}"></picture>`;
+}
+// Dipanggil saat gambar logo bergerak selesai dimuat
+export function stopLogo(img) {
+  const anim = img.dataset.logo;
+  if (!anim || img.dataset.timer || !img.currentSrc.includes(anim)) return;
+  img.dataset.timer = '1';
+  setTimeout(() => {
+    logoDone.add(anim);
+    document.querySelectorAll(`img[data-logo="${anim}"]`).forEach((el) => { if (!el.src.endsWith(LOGO_STATIC)) el.src = LOGO_STATIC; });
+  }, LOGO_MS + 400);
 }
 
 // Ilustrasi perangkat (untuk kartu perangkat & beranda)

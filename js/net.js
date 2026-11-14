@@ -4,7 +4,7 @@
 //  - Server sinyal hanya mempertemukan perangkat; isinya tidak dipercaya.
 //  - Semua pesan dari perangkat lain divalidasi. Berkas & media baru diproses
 //    setelah lapisan aplikasi menandai sambungan "authed" (lolos verifikasi).
-import { uid, isObj, okId, okCode, safeInt, safeMime, cleanFileName, cleanRel, cleanName, cleanStr } from './util.js?v=1.1.1';
+import { uid, isObj, okId, okCode, safeInt, safeMime, cleanFileName, cleanRel, cleanName, cleanStr } from './util.js?v=1.2.0';
 
 export const PREFIX = 'taut-v1-';
 export const DEFAULT_SIGNAL = 'wss://0.peerjs.com:443/peerjs';

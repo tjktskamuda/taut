@@ -1,10 +1,11 @@
 // Taut — service worker: aplikasi tetap bisa dibuka walau koneksi tidak stabil
-const V = '1.1.1';
+const V = '1.2.0';
 const CACHE = 'taut-v' + V;
 const SHELL = [
   './', 'index.html', 'css/app.css?v=' + V, 'js/app.js?v=' + V, 'js/net.js?v=' + V, 'js/util.js?v=' + V, 'js/icons.js?v=' + V,
   'lib/qrcode.js?v=' + V, 'lib/jsQR.js', 'manifest.webmanifest',
-  'js/boot.js?v=' + V, 'icons/favicon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
+  'js/boot.js?v=' + V, 'icons/favicon.png', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
+  'img/logo.png', 'img/logo-128.webp',
 ];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
