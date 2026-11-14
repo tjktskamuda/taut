@@ -3,11 +3,11 @@ import {
   $, $$, sleep, uid, randomCode, esc, linkify, firstUrl, fmtSize, fmtSpeed, fmtTime, fmtAgo,
   detectDevice, isMacLike, isIOS, canShareScreen, canCamera, isStandalone, LS, idb, fileKind, extOf,
   makeThumb, downloadBlob, shareBlob, makeZip, chime, audioCtx, loadScript,
-} from './util.js';
-import { icon, kindIcon, deviceIcon, logo, deviceArt } from './icons.js';
-import { Net, DEFAULT_SIGNAL } from './net.js';
+} from './util.js?v=1.0.1';
+import { icon, kindIcon, deviceIcon, logo, deviceArt } from './icons.js?v=1.0.1';
+import { Net, DEFAULT_SIGNAL } from './net.js?v=1.0.1';
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 const DEV = detectDevice();
 const APP_URL = location.origin + location.pathname.replace(/index\.html$/, '');
 const MOD = isMacLike() ? '⌘' : 'Ctrl';

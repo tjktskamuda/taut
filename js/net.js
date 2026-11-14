@@ -1,5 +1,5 @@
 // Taut — lapisan jaringan: server sinyal (protokol PeerJS) + WebRTC peer-to-peer
-import { uid } from './util.js';
+import { uid } from './util.js?v=1.0.1';
 
 export const PREFIX = 'taut-v1-';
 export const DEFAULT_SIGNAL = 'wss://0.peerjs.com:443/peerjs';
@@ -128,7 +128,7 @@ export class Link extends Emitter {
   _pc() {
     const pc = new RTCPeerConnection({ iceServers: ICE });
     pc.onicecandidate = (e) => {
-      if (e.candidate) this.net.signal.send('CANDIDATE', this.rid, { cid: this.cid, c: e.candidate.toJSON ? e.candidate.toJSON() : e.candidate });
+      if (e.candidate) this.net.signal.send('CANDIDATE', this.rid, candPayload(this.cid, e.candidate));
     };
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState;
@@ -151,7 +151,7 @@ export class Link extends Emitter {
     this._dc(pc.createDataChannel('taut', { ordered: true }));
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    const ok = this.net.signal.send('OFFER', this.rid, { cid: this.cid, sdp: pc.localDescription.sdp, hello });
+    const ok = this.net.signal.send('OFFER', this.rid, offerPayload(this.cid, pc.localDescription.sdp, hello));
     if (!ok) { this.close('nosignal'); return; }
     this._timeout(waitMs);
   }
@@ -164,7 +164,7 @@ export class Link extends Emitter {
     await this._flushIce();
     const ans = await pc.createAnswer();
     await pc.setLocalDescription(ans);
-    this.net.signal.send('ANSWER', this.rid, { cid: this.cid, sdp: pc.localDescription.sdp, hello });
+    this.net.signal.send('ANSWER', this.rid, answerPayload(this.cid, pc.localDescription.sdp, { hello }));
     this._timeout(30000);
   }
   async onAnswer(p) {
@@ -469,6 +469,29 @@ export class Link extends Emitter {
   }
 }
 
+// Bentuk pesan mengikuti skema server PeerJS (server publik menolak bentuk lain).
+// Data milik Taut dititipkan di kolom "metadata".
+function offerPayload(cid, sdp, hello) {
+  return { sdp: { type: 'offer', sdp }, type: 'data', connectionId: cid, label: cid, reliable: true, serialization: 'raw', browser: 'chrome', metadata: { app: 'taut', hello } };
+}
+function answerPayload(cid, sdp, meta) {
+  return { sdp: { type: 'answer', sdp }, type: 'data', connectionId: cid, browser: 'chrome', metadata: { app: 'taut', ...meta } };
+}
+function candPayload(cid, c) {
+  return { candidate: c.toJSON ? c.toJSON() : c, type: 'data', connectionId: cid };
+}
+function readPayload(p) {
+  const md = p.metadata || {};
+  return {
+    cid: p.connectionId || p.cid,
+    sdp: (p.sdp && typeof p.sdp === 'object') ? p.sdp.sdp : p.sdp,
+    hello: md.hello || p.hello || null,
+    reject: !!(md.reject || p.reject),
+    candidate: p.candidate || p.c || null,
+    taut: md.app === 'taut' || !!p.cid,
+  };
+}
+
 function isPrivate(ip) {
   if (!ip) return false;
   return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|fe80|fd|fc)/i.test(ip) || /\.local$/.test(ip);
@@ -515,9 +538,11 @@ export class Net extends Emitter {
     l.start(this.hello(), waitMs).catch((e) => { console.warn(e); l.close('error'); });
     return l;
   }
-  async _onSignal({ type, from, payload }) {
+  async _onSignal({ type, from, payload: raw }) {
+    const payload = readPayload(raw);
     const cid = payload.cid;
     if (type === 'OFFER') {
+      if (!payload.taut || !payload.sdp) return;
       const ex = this.links.get(from);
       if (ex && ex.state !== 'closed') {
         if (ex.cid === cid) return;
@@ -538,7 +563,7 @@ export class Net extends Emitter {
       this.emit('request', {
         from, hello,
         accept: () => go(),
-        reject: () => { this.signal.send('ANSWER', from, { cid, reject: true }); this.iceBuf.delete(cid); },
+        reject: () => { this.signal.send('ANSWER', from, answerPayload(cid, payload.sdp, { reject: true })); this.iceBuf.delete(cid); },
       });
       return;
     }
@@ -552,9 +577,9 @@ export class Net extends Emitter {
     }
     if (type === 'CANDIDATE') {
       const l = this.links.get(from);
-      if (l && l.cid === cid) { await l.onCandidate(payload.c); return; }
+      if (l && l.cid === cid) { await l.onCandidate(payload.candidate); return; }
       const arr = this.iceBuf.get(cid) || [];
-      arr.push(payload.c);
+      arr.push(payload.candidate);
       this.iceBuf.set(cid, arr);
       if (this.iceBuf.size > 50) this.iceBuf.delete(this.iceBuf.keys().next().value);
       return;
